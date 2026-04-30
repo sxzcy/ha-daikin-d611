@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a Daikin DTA117D611 integration issue
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      placeholder: "2026.4.4"
+    validations:
+      required: true
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      placeholder: "0.4.6"
+    validations:
+      required: true
+  - type: input
+    id: gateway
+    attributes:
+      label: Gateway model / type
+      placeholder: "DTA117D611"
+    validations:
+      required: true
+  - type: dropdown
+    id: device_type
+    attributes:
+      label: Affected device type
+      options:
+        - Air conditioner
+        - VAM / Mini VAM fresh-air unit
+        - Air sensor
+        - Gateway discovery
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: cloud_snapshot
+    attributes:
+      label: Cloud snapshot option
+      options:
+        - Enabled
+        - Disabled
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the expected behavior and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste Home Assistant logs and diagnostics after removing private data.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,12 @@
+{
+  "domain": "daikin_d611",
+  "name": "Daikin DTA117D611",
+  "codeowners": ["@mypal"],
+  "config_flow": true,
+  "documentation": "https://github.com/mypal/ha-daikin-d611",
+  "issue_tracker": "https://github.com/mypal/ha-daikin-d611/issues",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "requirements": ["cryptography>=41.0.0"],
+  "version": "0.4.6"
+}

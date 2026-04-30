@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "大金 DTA117D611",
+        "description": "连接大金 New Life Multi 账号和本地 DTA117D611 网关。",
+        "data": {
+          "username": "账号",
+          "password": "密码",
+          "gateway": "网关名称 / KEY / MAC",
+          "host": "本地网关地址覆盖",
+          "port": "本地网关端口覆盖",
+          "scan_interval": "轮询间隔",
+          "timeout": "超时"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接",
+      "auth": "认证失败",
+      "gateway_not_found": "没有找到网关",
+      "invalid_port": "端口无效",
+      "unknown": "未知错误"
+    },
+    "abort": {
+      "already_configured": "该网关已配置"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "大金 DTA117D611 选项",
+        "data": {
+          "scan_interval": "轮询间隔",
+          "timeout": "Socket / 云端超时",
+          "control_ack_timeout": "控制 ACK 等待超时",
+          "enable_cloud_snapshot": "使用云端快照补充状态",
+          "state_priority": "状态优先级",
+          "enable_diagnostic_entities": "创建诊断实体",
+          "use_stable_ids": "使用稳定物理 ID"
+        },
+        "data_description": {
+          "use_stable_ids": "优先使用网关 / 云端负载里的稳定物理 ID；已有条目会在重载时迁移旧 unique_id。"
+        }
+      }
+    }
+  }
+}

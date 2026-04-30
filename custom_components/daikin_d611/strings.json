@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Daikin DTA117D611",
+        "description": "Connect to Daikin New Life Multi and the local DTA117D611 gateway.",
+        "data": {
+          "username": "Account",
+          "password": "Password",
+          "gateway": "Gateway name/key/MAC",
+          "host": "Socket host override",
+          "port": "Socket port override",
+          "scan_interval": "Scan interval",
+          "timeout": "Timeout"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect",
+      "auth": "Authentication failed",
+          "gateway_not_found": "Gateway not found",
+          "invalid_port": "Invalid port",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Gateway is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Daikin DTA117D611 options",
+        "data": {
+          "scan_interval": "Scan interval",
+          "timeout": "Socket/cloud timeout",
+          "control_ack_timeout": "Control ACK timeout",
+          "enable_cloud_snapshot": "Use cloud snapshot as supplemental state",
+          "state_priority": "State priority",
+          "enable_diagnostic_entities": "Create diagnostic entities",
+          "use_stable_ids": "Use stable physical IDs"
+        },
+        "data_description": {
+          "use_stable_ids": "Uses stable physical IDs when the gateway/cloud payload exposes them. Existing entries can migrate legacy entity unique IDs on reload."
+        }
+      }
+    }
+  }
+}
