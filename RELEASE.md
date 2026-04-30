@@ -17,5 +17,5 @@
 
 4. Commit only clean release files.
 5. Push to GitHub.
-6. Create a tag matching the manifest version, for example `v0.4.6`.
+6. Create a tag matching the manifest version, for example `v0.4.7`.
 7. Add the GitHub repository to HACS as a custom integration repository.

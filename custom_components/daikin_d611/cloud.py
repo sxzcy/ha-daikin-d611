@@ -339,11 +339,25 @@ class DaikinCloudClient:
             if not needle
             or needle in " ".join([gateway.name, gateway.key, gateway.mac, gateway.host, compact_json(gateway.raw)]).casefold()
         ]
-        if not matches:
-            raise DaikinApiError(f"Gateway not found: {query}; cloud returned {len(candidates)} gateway(s)")
-        if len(matches) > 1:
-            _LOGGER.warning("Multiple gateways matched %s; using first: %s", query, matches[0])
-        gateway = matches[0]
+        if not matches and len(candidates) == 1:
+            gateway = candidates[0]
+            _LOGGER.info(
+                "Gateway query %s did not match; using the only cloud gateway: %s",
+                query,
+                gateway.name or gateway.key or gateway.mac,
+            )
+        elif not matches:
+            available = ", ".join(
+                gateway.name or gateway.key or gateway.mac or gateway.host
+                for gateway in candidates
+            )
+            raise DaikinApiError(
+                f"Gateway not found: {query}; available gateways: {available or 'none'}"
+            )
+        else:
+            if len(matches) > 1:
+                _LOGGER.warning("Multiple gateways matched %s; using first: %s", query, matches[0])
+            gateway = matches[0]
         if not gateway.host:
             raise DaikinApiError("Gateway has no socket host; set host override")
         return gateway

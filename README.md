@@ -67,6 +67,9 @@ Recommended initial values:
 - Scan interval: `60` seconds.
 - Timeout: `10` seconds.
 
+If the account only has one gateway, the integration will use that gateway even
+when the entered gateway label does not exactly match the cloud gateway name.
+
 If cloud lookup works but local socket access fails, fill Host/Port manually
 with the gateway address shown by your router or by Daikin app traffic.
 
