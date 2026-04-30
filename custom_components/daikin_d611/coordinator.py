@@ -77,10 +77,13 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         self.entry = entry
         self.gateway: DaikinGateway | None = None
         self.nlc_id: str | None = None
+        self._cached_devices: list[DaikinDevice] | None = None
+        self._last_cloud_snapshot_at: datetime | None = None
+        self._poll_timeout = max(1.0, min(float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT)), 5.0))
         self.cloud = DaikinCloudClient(
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
-            timeout=float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT)),
+            timeout=self._poll_timeout,
         )
         self._delayed_refresh_task: asyncio.Task | None = None
         update_interval = timedelta(seconds=int(self._option(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)))
@@ -133,7 +136,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     def _socket_client(self) -> DaikinSocketClient:
         gateway = self._ensure_gateway()
-        return DaikinSocketClient(gateway, nlc_id=str(self.nlc_id), timeout=self.timeout)
+        return DaikinSocketClient(gateway, nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
 
     @staticmethod
     def _merge_status(
@@ -220,9 +223,16 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
     def _normalize_key(value: Any) -> str:
         return str(value or "").replace(":", "").replace("-", "").casefold()
 
-    def _merge_cloud_snapshot(self, devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> None:
+    def _cloud_snapshot_due(self) -> bool:
         if not self._cloud_snapshot_enabled():
-            return
+            return False
+        if self._last_cloud_snapshot_at is None or not self.data:
+            return True
+        return datetime.now(timezone.utc) - self._last_cloud_snapshot_at >= timedelta(minutes=10)
+
+    def _merge_cloud_snapshot(self, devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
+        if not self._cloud_snapshot_enabled():
+            return False
         gateway = self._ensure_gateway()
         candidates = [gateway.key]
         if gateway.mac and gateway.mac != gateway.key:
@@ -242,7 +252,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         if not snapshot:
             if last_error:
                 _LOGGER.debug("No ipbox snapshot available: %s", last_error)
-            return
+            return False
         refreshed_at = _utc_now_iso()
 
         online_by_key: dict[str, Any] = {}
@@ -271,6 +281,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                 self._cloud_status_for_item(item, refreshed_at),
                 preserve_existing_values=preserve_existing,
             )
+        return True
 
     def _match_cloud_item(
         self,
@@ -312,14 +323,37 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     def _refresh_sync(self) -> dict[str, DaikinDevice]:
         socket_client = self._socket_client()
-        devices = socket_client.query_devices()
-        statuses = socket_client.query_statuses(devices)
+        if self._cached_devices:
+            devices = self._cached_devices
+        else:
+            try:
+                devices = socket_client.query_devices()
+                self._cached_devices = devices
+            except (DaikinError, TimeoutError, OSError) as exc:
+                if self.data:
+                    _LOGGER.warning("Failed to refresh Daikin D611 room list; using previous devices: %s", exc)
+                    devices = list(self.data.values())
+                    self._cached_devices = devices
+                else:
+                    raise
+        try:
+            statuses = socket_client.query_statuses(devices)
+        except (DaikinError, TimeoutError, OSError) as exc:
+            if not self.data:
+                raise
+            _LOGGER.warning("Failed to refresh Daikin D611 statuses; keeping previous values: %s", exc)
+            statuses = {}
         refreshed_at = _utc_now_iso()
         statuses = {
             device_id: self._annotate_local_status(status, refreshed_at, socket_client.gateway)
             for device_id, status in statuses.items()
         }
-        self._merge_cloud_snapshot(devices, statuses)
+        if self._cloud_snapshot_due():
+            try:
+                if self._merge_cloud_snapshot(devices, statuses):
+                    self._last_cloud_snapshot_at = datetime.now(timezone.utc)
+            except (DaikinError, TimeoutError, OSError) as exc:
+                _LOGGER.warning("Failed to refresh Daikin D611 cloud snapshot; using local state: %s", exc)
         result: dict[str, DaikinDevice] = {}
         for device in devices:
             statuses.setdefault(device.unique_id, {})
@@ -336,7 +370,10 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
     async def _async_update_data(self) -> dict[str, DaikinDevice]:
         try:
             return await self.hass.async_add_executor_job(self._refresh_sync)
-        except DaikinError as exc:
+        except (DaikinError, TimeoutError, OSError) as exc:
+            if self.data:
+                _LOGGER.warning("Daikin D611 update failed; keeping previous data: %s", exc)
+                return self.data
             raise UpdateFailed(str(exc)) from exc
 
     def _control_sync(self, device_id: str, values: dict[str, Any]) -> dict[str, Any]:

@@ -25,6 +25,8 @@ _LOGGER = logging.getLogger(__name__)
 class DaikinSocketClient:
     """DTA117D611 local socket client."""
 
+    PHASE_READ_TIMEOUT = 2.0
+
     CMD_LOGIN = 16
     CMD_GET_ROOM_INFO = 48
     CMD_GET_ROOM_INFO_V1 = 304
@@ -718,6 +720,8 @@ class DaikinSocketClient:
     def query_statuses(self, devices: list[DaikinDevice]) -> dict[str, dict[str, Any]]:
         statuses: dict[str, dict[str, Any]] = {}
         with self._connect_and_login() as sock:
+            original_timeout = sock.gettimeout()
+            sock.settimeout(min(self.timeout, self.PHASE_READ_TIMEOUT))
             pending: dict[int, DaikinDevice] = {}
             pending_cmd: dict[int, int] = {}
             for device in devices:
@@ -734,9 +738,12 @@ class DaikinSocketClient:
                 pending_cmd[request_id] = cmd
                 sock.sendall(frame)
 
-            deadline = time.monotonic() + max(self.timeout, len(pending) * 2)
+            deadline = time.monotonic() + min(max(3.0, len(pending) * 1.0), self.timeout)
             while pending and time.monotonic() < deadline:
-                message = self._read_frame(sock)
+                try:
+                    message = self._read_frame(sock)
+                except (socket.timeout, TimeoutError):
+                    break
                 if message.get("cmd") == "HEARTBEAT":
                     continue
                 inner = message.get("inner") if isinstance(message.get("inner"), dict) else message
@@ -763,9 +770,12 @@ class DaikinSocketClient:
                 composite_pending[request_id] = device
                 sock.sendall(frame)
 
-            composite_deadline = time.monotonic() + max(min(self.timeout, 8), len(composite_pending) * 2)
+            composite_deadline = time.monotonic() + min(max(1.5, len(composite_pending) * 1.0), self.timeout, 3.0)
             while composite_pending and time.monotonic() < composite_deadline:
-                message = self._read_frame(sock)
+                try:
+                    message = self._read_frame(sock)
+                except (socket.timeout, TimeoutError):
+                    break
                 if message.get("cmd") == "HEARTBEAT":
                     continue
                 inner = message.get("inner") if isinstance(message.get("inner"), dict) else message
@@ -793,9 +803,12 @@ class DaikinSocketClient:
                     air_sensor_pending[request_id] = query_cmd
                     sock.sendall(frame)
 
-                air_sensor_deadline = time.monotonic() + max(min(self.timeout, 8), len(air_sensor_pending) * 2)
+                air_sensor_deadline = time.monotonic() + min(max(1.5, len(air_sensor_pending) * 1.0), self.timeout, 3.0)
                 while air_sensor_pending and time.monotonic() < air_sensor_deadline:
-                    message = self._read_frame(sock)
+                    try:
+                        message = self._read_frame(sock)
+                    except (socket.timeout, TimeoutError):
+                        break
                     if message.get("cmd") == "HEARTBEAT":
                         continue
                     inner = message.get("inner") if isinstance(message.get("inner"), dict) else message
@@ -821,6 +834,7 @@ class DaikinSocketClient:
                             **statuses.get(device.unique_id, {}),
                             **matched,
                         }
+            sock.settimeout(original_timeout)
         return statuses
 
     def control_device(
