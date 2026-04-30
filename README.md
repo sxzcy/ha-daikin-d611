@@ -1,5 +1,7 @@
 # Daikin DTA117D611 for Home Assistant
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Home Assistant custom integration for Daikin New Life Multi gateways using the
 DTA117D611 local socket protocol.
 
