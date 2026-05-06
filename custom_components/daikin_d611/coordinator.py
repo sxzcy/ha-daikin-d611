@@ -134,6 +134,11 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             raise DaikinError("Could not get nlcId")
         return self.gateway
 
+    def _rediscover_gateway(self) -> DaikinGateway:
+        self.gateway = None
+        self._cached_devices = None
+        return self._ensure_gateway()
+
     def _socket_client(self) -> DaikinSocketClient:
         gateway = self._ensure_gateway()
         return DaikinSocketClient(gateway, nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
@@ -321,6 +326,14 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                 return item
         return None
 
+    @staticmethod
+    def _has_local_control_status(devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
+        return any(
+            device.device_type in AIR_CON_TYPES or device.device_type in VAM_TYPES
+            for device in devices
+            if statuses.get(device.unique_id)
+        )
+
     def _refresh_sync(self) -> dict[str, DaikinDevice]:
         socket_client = self._socket_client()
         if self._cached_devices:
@@ -338,11 +351,22 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                     raise
         try:
             statuses = socket_client.query_statuses(devices)
+            if not self._has_local_control_status(devices, statuses):
+                raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
         except (DaikinError, TimeoutError, OSError) as exc:
-            if not self.data:
-                raise
-            _LOGGER.warning("Failed to refresh Daikin D611 statuses; keeping previous values: %s", exc)
-            statuses = {}
+            _LOGGER.warning("Failed to refresh Daikin D611 statuses via %s; rediscovering gateway: %s", socket_client.gateway.host, exc)
+            try:
+                socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+                devices = socket_client.query_devices()
+                self._cached_devices = devices
+                statuses = socket_client.query_statuses(devices)
+                if not self._has_local_control_status(devices, statuses):
+                    raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
+            except (DaikinError, TimeoutError, OSError) as retry_exc:
+                if not self.data:
+                    raise
+                _LOGGER.warning("Failed to refresh Daikin D611 statuses after gateway rediscovery; keeping previous values: %s", retry_exc)
+                statuses = {}
         refreshed_at = _utc_now_iso()
         statuses = {
             device_id: self._annotate_local_status(status, refreshed_at, socket_client.gateway)
@@ -378,7 +402,23 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     def _control_sync(self, device_id: str, values: dict[str, Any]) -> dict[str, Any]:
         device = self.data[device_id]
-        return self._socket_client().control_device(device, ack_timeout=self.control_ack_timeout, **values)
+        socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+        try:
+            result = socket_client.control_device(device, ack_timeout=self.control_ack_timeout, **values)
+        except (DaikinError, TimeoutError, OSError) as exc:
+            _LOGGER.warning("Daikin D611 control via %s failed; rediscovering gateway: %s", socket_client.gateway.host, exc)
+            result = {"result": "socket_error", "error": str(exc)}
+        if result.get("result") == "accepted":
+            return result
+        _LOGGER.warning("Daikin D611 control via %s returned %s; rediscovering gateway", socket_client.gateway.host, result.get("result"))
+        socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+        try:
+            retry_result = socket_client.control_device(device, ack_timeout=max(self.control_ack_timeout, 5), **values)
+        except (DaikinError, TimeoutError, OSError) as exc:
+            raise DaikinError(f"Control command failed after gateway rediscovery: {exc}") from exc
+        if retry_result.get("result") != "accepted":
+            raise DaikinError(f"Control command was not accepted: {retry_result}")
+        return retry_result
 
     def _apply_optimistic_status(
         self,
