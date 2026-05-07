@@ -8,7 +8,7 @@ optimization targets.
 
 - GitHub: https://github.com/sxzcy/ha-daikin-d611
 - HACS category: Integration
-- Current release: `v0.4.7`
+- Current release: `v0.4.10`
 - Home Assistant domain: `daikin_d611`
 - Integration name: `Daikin DTA117D611`
 
@@ -18,7 +18,7 @@ optimization targets.
 - GitHub Actions has two successful jobs:
   - HACS official validation through `hacs/action@main`
   - Local validation for Python compile, JSON files, and parser fixtures
-- GitHub Release `v0.4.7` exists.
+- GitHub Release `v0.4.10` exists.
 - The integration is intended for Daikin New Life Multi accounts with a
   DTA117D611 gateway.
 - Runtime behavior is local-first after cloud-assisted setup.
@@ -54,9 +54,9 @@ Observed cloud gateway payload shape:
 - Gateway key / MAC may be the useful stable identifier, for example a
   12-character hex-like string.
 - Users may naturally type `DTA117D611` in the gateway field.
-- Since `v0.4.7`, if the cloud account has exactly one gateway, the integration
-  automatically uses that gateway even when the entered gateway label does not
-  exactly match the cloud gateway name.
+- If the cloud account has exactly one gateway, the integration automatically
+  uses that gateway even when the entered gateway label does not exactly match
+  the cloud gateway name.
 
 Do not hardcode any real account, password, token, SSH key, IP address, or local
 gateway secret into this repository.
@@ -85,7 +85,7 @@ authoritative public check.
 2. Update release notes.
 3. Run local validation.
 4. Commit to `main`.
-5. Create annotated tag matching the manifest version, for example `v0.4.8`.
+5. Create annotated tag matching the manifest version, for example `v0.4.11`.
 6. Push `main` and tags.
 7. Create a GitHub Release for the tag.
 8. Confirm GitHub Actions HACS validation passes.
@@ -119,4 +119,3 @@ https://github.com/sxzcy/ha-daikin-d611
 Read CODEX_HANDOFF.md first, then inspect the current code before changing it.
 Focus on the next optimization target: <describe target>.
 ```
-
