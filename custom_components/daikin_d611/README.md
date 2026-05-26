@@ -1,4 +1,4 @@
-# Daikin DTA117D611 for Home Assistant
+# Daikin D611 Bridge for Home Assistant
 
 Home Assistant custom integration for Daikin New Life Multi gateways using the
 DTA117D611 local socket protocol.
@@ -36,10 +36,10 @@ Mini VAM / VAM fresh-air devices, and sensors.
 
 1. Add this repository to HACS as a custom repository.
 2. Choose category `Integration`.
-3. Install `Daikin DTA117D611`.
+3. Install `Daikin D611 Bridge`.
 4. Restart Home Assistant.
 5. Go to **Settings -> Devices & services -> Add integration**.
-6. Search for `Daikin DTA117D611`.
+6. Search for `Daikin D611 Bridge`.
 
 ## Manual Installation
 

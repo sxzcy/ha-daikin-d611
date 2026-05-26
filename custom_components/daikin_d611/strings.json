@@ -2,8 +2,8 @@
   "config": {
     "step": {
       "user": {
-        "title": "Daikin DTA117D611",
-        "description": "Connect to Daikin New Life Multi and the local DTA117D611 gateway.",
+        "title": "Daikin D611 Bridge",
+        "description": "Connect Daikin New Life Multi to the local D611 gateway bridge.",
         "data": {
           "username": "Account",
           "password": "Password",
@@ -29,7 +29,7 @@
   "options": {
     "step": {
       "init": {
-        "title": "Daikin DTA117D611 options",
+        "title": "Daikin D611 Bridge options",
         "data": {
           "scan_interval": "Scan interval",
           "timeout": "Socket/cloud timeout",

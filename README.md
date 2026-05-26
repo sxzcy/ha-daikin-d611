@@ -1,4 +1,4 @@
-# Daikin DTA117D611 for Home Assistant
+# Daikin D611 Bridge for Home Assistant
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -38,10 +38,10 @@ Mini VAM / VAM fresh-air devices, and sensors.
 1. Open HACS.
 2. Add this repository as a custom repository.
 3. Choose category `Integration`.
-4. Install `Daikin DTA117D611`.
+4. Install `Daikin D611 Bridge`.
 5. Restart Home Assistant.
 6. Go to **Settings -> Devices & services -> Add integration**.
-7. Search for `Daikin DTA117D611`.
+7. Search for `Daikin D611 Bridge`.
 
 ## Manual Installation
 

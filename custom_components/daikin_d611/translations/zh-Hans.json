@@ -2,8 +2,8 @@
   "config": {
     "step": {
       "user": {
-        "title": "大金 DTA117D611",
-        "description": "连接大金 New Life Multi 账号和本地 DTA117D611 网关。",
+        "title": "大金 D611 网关",
+        "description": "连接大金 New Life Multi 账号和本地 D611 网关桥接。",
         "data": {
           "username": "账号",
           "password": "密码",
@@ -29,7 +29,7 @@
   "options": {
     "step": {
       "init": {
-        "title": "大金 DTA117D611 选项",
+        "title": "大金 D611 网关选项",
         "data": {
           "scan_interval": "轮询间隔",
           "timeout": "Socket / 云端超时",

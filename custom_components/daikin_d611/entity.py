@@ -52,25 +52,16 @@ class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
         device = self.device
         attributes = {
             "gateway": device.gateway_name,
-            "legacy_unique_id": device.unique_id,
-            "stable_physical_id": device.stable_physical_id,
             "room_id": device.room_id,
             "room_name": device.room_name,
             "room_alias": device.room_alias,
             "device_type": device.device_type,
             "device_type_name": device.device_type_name,
             "unit": device.unit,
-            "raw_status": device.status.get("raw"),
         }
         for key in (
             "local_temperature",
             "composite_temperature",
-            "composite_raw",
-            "composite_tags",
-            "air_sensor_info_raw",
-            "air_sensor_status_raw",
-            "air_sensor_status_tags",
-            "air_sensor_mac",
             "local_sensor_temperature",
             "local_humidity",
             "local_pm25",
@@ -89,10 +80,10 @@ class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
             "last_control_result",
             "last_control_values",
             "last_control_ack_cmd",
-            "last_control_ack_body",
             "last_control_ack_request_id",
             "local_gateway_available",
             "cloud_snapshot_available",
+            "state_stale",
         ):
             if key in device.status:
                 attributes[key] = device.status[key]

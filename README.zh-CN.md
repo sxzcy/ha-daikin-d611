@@ -1,4 +1,4 @@
-# 大金 DTA117D611 Home Assistant 集成
+# 大金 D611 网关 Home Assistant 集成
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -35,10 +35,10 @@ Socket 通道轮询和控制设备。
 1. 打开 HACS。
 2. 添加本仓库为自定义仓库。
 3. 仓库类型选择 `Integration`。
-4. 安装 `Daikin DTA117D611`。
+4. 安装 `Daikin D611 Bridge`。
 5. 重启 Home Assistant。
 6. 进入 **设置 -> 设备与服务 -> 添加集成**。
-7. 搜索 `Daikin DTA117D611` 并添加。
+7. 搜索 `大金 D611 网关` 或 `Daikin D611 Bridge` 并添加。
 
 自定义仓库地址：
 

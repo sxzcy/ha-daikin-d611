@@ -19,6 +19,7 @@ TO_REDACT = {
     "token",
     "accessToken",
     "access_token",
+    "device_id",
     "gatewayKey",
     "gatewayMac",
     "mac",
@@ -30,6 +31,7 @@ TO_REDACT = {
     "cloud_key",
     "raw",
     "raw_status",
+    "stable_physical_id",
     "status_json",
     "last_control_ack_body",
 }

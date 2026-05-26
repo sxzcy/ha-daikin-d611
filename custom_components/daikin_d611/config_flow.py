@@ -40,6 +40,7 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+OPTIONS_FLOW_BASE = getattr(config_entries, "OptionsFlowWithReload", config_entries.OptionsFlow)
 
 
 def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
@@ -102,7 +103,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     def async_get_options_flow(config_entry: config_entries.ConfigEntry):
-        return OptionsFlowHandler(config_entry)
+        handler = OptionsFlowHandler()
+        handler._config_entry = config_entry
+        return handler
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Handle the initial step."""
@@ -134,7 +137,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 await self.async_set_unique_id(gateway.id)
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(title=gateway.name or "Daikin DTA117D611", data=data)
+                return self.async_create_entry(title=gateway.name or "Daikin D611 Bridge", data=data)
 
         return self.async_show_form(step_id="user", data_schema=_schema(user_input), errors=errors)
 
@@ -159,11 +162,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return gateway
 
 
-class OptionsFlowHandler(config_entries.OptionsFlow):
+class OptionsFlowHandler(OPTIONS_FLOW_BASE):
     """Handle Daikin D611 options."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self.config_entry = config_entry
+    _config_entry: config_entries.ConfigEntry | None = None
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
@@ -173,8 +175,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             options[CONF_CONTROL_ACK_TIMEOUT] = max(0, int(options[CONF_CONTROL_ACK_TIMEOUT]))
             return self.async_create_entry(title="", data=options)
 
+        config_entry = getattr(self, "config_entry", None) or self._config_entry
+        if config_entry is None:
+            raise RuntimeError("Config entry is not available for Daikin D611 options")
         defaults = {
-            **self.config_entry.data,
-            **self.config_entry.options,
+            **config_entry.data,
+            **config_entry.options,
         }
         return self.async_show_form(step_id="init", data_schema=_options_schema(defaults))

@@ -82,6 +82,7 @@ class DaikinDevice:
     alias: str
     status: dict[str, Any] = field(default_factory=dict)
     available: bool = True
+    stable_id: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -110,6 +111,8 @@ class DaikinDevice:
 
     @property
     def stable_physical_id(self) -> str:
+        if self.stable_id:
+            return self.stable_id
         cloud_physics = self.status.get("cloud_physics")
         physics = cloud_physics if isinstance(cloud_physics, dict) else {}
         candidates = (

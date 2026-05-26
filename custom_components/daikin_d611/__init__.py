@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
@@ -27,14 +28,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    if not hasattr(config_entries, "OptionsFlowWithReload"):
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     if coordinator.gateway is not None:
         device_registry = dr.async_get(hass)
         device_registry.async_get_or_create(
             config_entry_id=entry.entry_id,
             identifiers={(DOMAIN, coordinator.gateway.id)},
             manufacturer="Daikin",
-            name=coordinator.gateway.name or "Daikin DTA117D611",
+            name=coordinator.gateway.name or "Daikin D611 Gateway",
             model="DTA117D611 Gateway",
         )
     if entry.options.get(CONF_USE_STABLE_IDS, DEFAULT_USE_STABLE_IDS):
@@ -102,5 +104,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            coordinator.cancel_delayed_refresh()
     return unload_ok

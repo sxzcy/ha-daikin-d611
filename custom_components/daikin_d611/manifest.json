@@ -1,6 +1,6 @@
 {
   "domain": "daikin_d611",
-  "name": "Daikin DTA117D611",
+  "name": "Daikin D611 Bridge",
   "codeowners": ["@sxzcy"],
   "config_flow": true,
   "documentation": "https://github.com/sxzcy/ha-daikin-d611",
@@ -8,5 +8,5 @@
   "integration_type": "hub",
   "iot_class": "local_polling",
   "requirements": ["cryptography>=41.0.0"],
-  "version": "0.4.10"
+  "version": "1.0.0"
 }

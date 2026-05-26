@@ -16,9 +16,10 @@ from homeassistant.const import (
     CONF_USERNAME,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import DaikinCloudClient, DaikinError, DaikinSocketClient, first_value, to_int, to_list
+from .api import DaikinAuthError, DaikinCloudClient, DaikinError, DaikinSocketClient, first_value, to_int, to_list
 from .const import (
     AIR_CON_TYPES,
     AIR_SENSOR_TYPES,
@@ -63,7 +64,12 @@ SOURCE_METADATA_KEYS = {
     "cloud_snapshot_available",
     "raw",
     "state_sources",
+    "state_stale",
 }
+
+CLOUD_SNAPSHOT_INTERVAL = timedelta(minutes=10)
+WARNING_COOLDOWN = timedelta(minutes=5)
+DELAYED_REFRESH_SECONDS = 15
 
 
 def _utc_now_iso() -> str:
@@ -79,7 +85,8 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         self.nlc_id: str | None = None
         self._cached_devices: list[DaikinDevice] | None = None
         self._last_cloud_snapshot_at: datetime | None = None
-        self._poll_timeout = max(1.0, min(float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT)), 5.0))
+        self._last_warning_at: dict[str, datetime] = {}
+        self._poll_timeout = max(1.0, float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT)))
         self.cloud = DaikinCloudClient(
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
@@ -104,6 +111,18 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     def _option(self, key: str, default: Any) -> Any:
         return self.entry.options.get(key, self.entry.data.get(key, default))
+
+    def _log_warning_limited(self, key: str, message: str, *args: Any) -> None:
+        now = datetime.now(timezone.utc)
+        previous = self._last_warning_at.get(key)
+        if previous is None or now - previous >= WARNING_COOLDOWN:
+            self._last_warning_at[key] = now
+            _LOGGER.warning(message, *args)
+            return
+        _LOGGER.debug(message, *args)
+
+    def _clear_warning(self, key: str) -> None:
+        self._last_warning_at.pop(key, None)
 
     def _cloud_snapshot_enabled(self) -> bool:
         return bool(self._option(CONF_ENABLE_CLOUD_SNAPSHOT, DEFAULT_ENABLE_CLOUD_SNAPSHOT))
@@ -205,7 +224,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         cloud: dict[str, Any] = {
             **status,
             "cloud_key": item.get("key"),
-            "cloud_online": item.get("online"),
+            "cloud_online": cls._cloud_bool(item.get("online")),
             "cloud_physics": physics,
         }
         if item.get("key") and str(item["key"]).startswith("SENSOR:"):
@@ -221,6 +240,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         if refreshed_at:
             cloud["last_cloud_refresh"] = refreshed_at
             cloud["cloud_source"] = "snapshot"
+        cloud = cls._normalize_cloud_status_values(cloud)
         cloud["state_sources"] = cls._source_map(cloud, "cloud")
         return cloud
 
@@ -233,7 +253,59 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             return False
         if self._last_cloud_snapshot_at is None or not self.data:
             return True
-        return datetime.now(timezone.utc) - self._last_cloud_snapshot_at >= timedelta(minutes=10)
+        return datetime.now(timezone.utc) - self._last_cloud_snapshot_at >= CLOUD_SNAPSHOT_INTERVAL
+
+    @staticmethod
+    def _cloud_bool(value: Any) -> bool | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        text = str(value).strip().casefold()
+        if text in {"1", "true", "on", "online", "yes"}:
+            return True
+        if text in {"0", "false", "off", "offline", "no"}:
+            return False
+        return None
+
+    @staticmethod
+    def _cloud_float(value: Any) -> float | Any:
+        if value in (None, ""):
+            return value
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+
+    @classmethod
+    def _normalize_cloud_status_values(cls, status: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(status)
+        for key in (
+            "switch",
+            "switches",
+            "mode",
+            "air_flow",
+            "volume",
+            "outdoor_status",
+            "filter_used_time",
+            "filter_used_percent",
+            "pm25",
+            "co2",
+            "voc",
+            "tvoc_status",
+            "hcho_status",
+        ):
+            if key in normalized:
+                normalized[key] = first_value(to_int(normalized[key]), normalized[key])
+        for key in ("temp", "target_temperature", "sensor_temperature", "humidity", "hcho", "tvoc"):
+            if key in normalized:
+                normalized[key] = cls._cloud_float(normalized[key])
+        for key in ("online", "cloud_online"):
+            if key in normalized:
+                normalized[key] = first_value(cls._cloud_bool(normalized[key]), normalized[key])
+        return normalized
 
     def _merge_cloud_snapshot(self, devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
         if not self._cloud_snapshot_enabled():
@@ -328,9 +400,16 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     @staticmethod
     def _has_local_control_status(devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
+        controllable_devices = [
+            device
+            for device in devices
+            if device.device_type in AIR_CON_TYPES or device.device_type in VAM_TYPES
+        ]
+        if not controllable_devices:
+            return bool(statuses)
         return any(
             device.device_type in AIR_CON_TYPES or device.device_type in VAM_TYPES
-            for device in devices
+            for device in controllable_devices
             if statuses.get(device.unique_id)
         )
 
@@ -342,9 +421,16 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             try:
                 devices = socket_client.query_devices()
                 self._cached_devices = devices
+                self._clear_warning("room_list")
+            except DaikinAuthError:
+                raise
             except (DaikinError, TimeoutError, OSError) as exc:
                 if self.data:
-                    _LOGGER.warning("Failed to refresh Daikin D611 room list; using previous devices: %s", exc)
+                    self._log_warning_limited(
+                        "room_list",
+                        "Failed to refresh Daikin D611 room list; using previous devices: %s",
+                        exc,
+                    )
                     devices = list(self.data.values())
                     self._cached_devices = devices
                 else:
@@ -353,8 +439,16 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             statuses = socket_client.query_statuses(devices)
             if not self._has_local_control_status(devices, statuses):
                 raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
+            self._clear_warning("local_status")
+        except DaikinAuthError:
+            raise
         except (DaikinError, TimeoutError, OSError) as exc:
-            _LOGGER.warning("Failed to refresh Daikin D611 statuses via %s; rediscovering gateway: %s", socket_client.gateway.host, exc)
+            self._log_warning_limited(
+                "local_status",
+                "Failed to refresh Daikin D611 statuses via %s; rediscovering gateway: %s",
+                socket_client.gateway.host,
+                exc,
+            )
             try:
                 socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
                 devices = socket_client.query_devices()
@@ -362,53 +456,88 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                 statuses = socket_client.query_statuses(devices)
                 if not self._has_local_control_status(devices, statuses):
                     raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
+                self._clear_warning("local_status")
+                self._clear_warning("local_status_retry")
+            except DaikinAuthError:
+                raise
             except (DaikinError, TimeoutError, OSError) as retry_exc:
                 if not self.data:
                     raise
-                _LOGGER.warning("Failed to refresh Daikin D611 statuses after gateway rediscovery; keeping previous values: %s", retry_exc)
+                self._log_warning_limited(
+                    "local_status_retry",
+                    "Failed to refresh Daikin D611 statuses after gateway rediscovery; keeping previous values: %s",
+                    retry_exc,
+                )
                 statuses = {}
         refreshed_at = _utc_now_iso()
         statuses = {
             device_id: self._annotate_local_status(status, refreshed_at, socket_client.gateway)
             for device_id, status in statuses.items()
         }
-        if self._cloud_snapshot_due():
+        cloud_snapshot_attempted = self._cloud_snapshot_due()
+        if cloud_snapshot_attempted:
             try:
                 if self._merge_cloud_snapshot(devices, statuses):
                     self._last_cloud_snapshot_at = datetime.now(timezone.utc)
+                    self._clear_warning("cloud_snapshot")
+            except DaikinAuthError:
+                raise
             except (DaikinError, TimeoutError, OSError) as exc:
-                _LOGGER.warning("Failed to refresh Daikin D611 cloud snapshot; using local state: %s", exc)
+                self._log_warning_limited(
+                    "cloud_snapshot",
+                    "Failed to refresh Daikin D611 cloud snapshot; using local state: %s",
+                    exc,
+                )
         result: dict[str, DaikinDevice] = {}
         for device in devices:
-            statuses.setdefault(device.unique_id, {})
-            statuses[device.unique_id]["local_gateway_available"] = bool(statuses[device.unique_id].get("last_local_refresh"))
-            statuses[device.unique_id]["cloud_snapshot_available"] = bool(statuses[device.unique_id].get("last_cloud_refresh"))
+            status_update = statuses.setdefault(device.unique_id, {})
+            fresh_local = bool(status_update.get("last_local_refresh"))
+            fresh_cloud = bool(status_update.get("last_cloud_refresh"))
             previous = self.data.get(device.unique_id) if self.data else None
+            status_update["local_gateway_available"] = fresh_local
+            if cloud_snapshot_attempted or previous is None:
+                status_update["cloud_snapshot_available"] = fresh_cloud
+            else:
+                status_update["cloud_snapshot_available"] = bool(previous.status.get("cloud_snapshot_available"))
+            status_update["state_stale"] = not (fresh_local or fresh_cloud)
             if previous is not None:
                 device.status = {**previous.status, **statuses.get(device.unique_id, {})}
+                device.stable_id = previous.stable_physical_id
             else:
                 device.status = statuses.get(device.unique_id, device.status)
+                device.stable_id = device.stable_physical_id
+            device.available = not device.status.get("state_stale", False)
             result[device.unique_id] = device
         return result
 
     async def _async_update_data(self) -> dict[str, DaikinDevice]:
         try:
             return await self.hass.async_add_executor_job(self._refresh_sync)
+        except DaikinAuthError as exc:
+            raise ConfigEntryAuthFailed(str(exc)) from exc
         except (DaikinError, TimeoutError, OSError) as exc:
             if self.data:
-                _LOGGER.warning("Daikin D611 update failed; keeping previous data: %s", exc)
+                self._log_warning_limited("update", "Daikin D611 update failed; keeping previous data: %s", exc)
                 return self.data
             raise UpdateFailed(str(exc)) from exc
 
     def _control_sync(self, device_id: str, values: dict[str, Any]) -> dict[str, Any]:
         device = self.data[device_id]
-        socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+        socket_client = self._socket_client()
         try:
             result = socket_client.control_device(device, ack_timeout=self.control_ack_timeout, **values)
         except (DaikinError, TimeoutError, OSError) as exc:
             _LOGGER.warning("Daikin D611 control via %s failed; rediscovering gateway: %s", socket_client.gateway.host, exc)
-            result = {"result": "socket_error", "error": str(exc)}
-        if result.get("result") == "accepted":
+            socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+            try:
+                retry_result = socket_client.control_device(device, ack_timeout=max(self.control_ack_timeout, 5), **values)
+            except (DaikinError, TimeoutError, OSError) as retry_exc:
+                raise DaikinError(f"Control command failed after gateway rediscovery: {retry_exc}") from retry_exc
+            if retry_result.get("result") in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
+                return retry_result
+            raise DaikinError(f"Control command was not accepted: {retry_result}")
+
+        if result.get("result") in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
             return result
         _LOGGER.warning("Daikin D611 control via %s returned %s; rediscovering gateway", socket_client.gateway.host, result.get("result"))
         socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
@@ -416,7 +545,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             retry_result = socket_client.control_device(device, ack_timeout=max(self.control_ack_timeout, 5), **values)
         except (DaikinError, TimeoutError, OSError) as exc:
             raise DaikinError(f"Control command failed after gateway rediscovery: {exc}") from exc
-        if retry_result.get("result") != "accepted":
+        if retry_result.get("result") not in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
             raise DaikinError(f"Control command was not accepted: {retry_result}")
         return retry_result
 
@@ -454,18 +583,26 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         else:
             status["last_control_result"] = "optimistic_local_command_sent"
         status["last_control_values"] = dict(values)
+        status["local_gateway_available"] = True
+        status["state_stale"] = False
         status["state_sources"] = self._source_map(status, "optimistic")
         device.status = self._merge_status(device.status, status)
+        device.available = True
         self.async_set_updated_data(dict(self.data))
 
     async def _async_delayed_refresh(self) -> None:
-        await asyncio.sleep(15)
+        await asyncio.sleep(DELAYED_REFRESH_SECONDS)
         await self.async_request_refresh()
 
     def _schedule_delayed_refresh(self) -> None:
         if self._delayed_refresh_task and not self._delayed_refresh_task.done():
             self._delayed_refresh_task.cancel()
         self._delayed_refresh_task = self.hass.async_create_task(self._async_delayed_refresh())
+
+    def cancel_delayed_refresh(self) -> None:
+        if self._delayed_refresh_task and not self._delayed_refresh_task.done():
+            self._delayed_refresh_task.cancel()
+        self._delayed_refresh_task = None
 
     async def async_control_device(self, device_id: str, **values: Any) -> None:
         """Send a local socket control command, then refresh state."""
