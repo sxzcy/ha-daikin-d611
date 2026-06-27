@@ -14,6 +14,7 @@ from .const import (
     DEVICE_TYPE_AIR_CON_BATHROOM,
     DEVICE_TYPE_AIR_CON_NEW,
     DEVICE_TYPE_AIR_SENSOR,
+    DEVICE_TYPE_GEOTHERMIC,
     DEVICE_TYPE_MINI_VAM,
     DEVICE_TYPE_VAM,
 )
@@ -44,6 +45,7 @@ class DaikinSocketClient:
         DEVICE_TYPE_AIR_CON: "AIR_CON",
         DEVICE_TYPE_AIR_CON_NEW: "AIR_CON_NEW",
         DEVICE_TYPE_AIR_CON_BATHROOM: "AIR_CON_BATHROOM",
+        DEVICE_TYPE_GEOTHERMIC: "GEOTHERMIC",
         DEVICE_TYPE_VAM: "VAM",
         DEVICE_TYPE_MINI_VAM: "MINI_VAM",
         DEVICE_TYPE_AIR_SENSOR: "AIR_SENSOR",
@@ -265,6 +267,27 @@ class DaikinSocketClient:
 
     def parse_room_info(self, message: dict[str, Any]) -> list[DaikinDevice]:
         body = message.get("body") or b""
+        errors: list[Exception] = []
+        for always_read_device_names in (False, True):
+            try:
+                devices, pos = self._parse_room_info_body(
+                    body,
+                    always_read_device_names=always_read_device_names,
+                )
+            except (IndexError, struct.error, DaikinSocketError) as exc:
+                errors.append(exc)
+                continue
+            if pos == len(body):
+                return devices
+            errors.append(DaikinSocketError(f"Room info parser stopped at {pos}/{len(body)}"))
+        raise DaikinSocketError(f"Could not parse room info: {errors[-1] if errors else body.hex()}")
+
+    def _parse_room_info_body(
+        self,
+        body: bytes,
+        *,
+        always_read_device_names: bool,
+    ) -> tuple[list[DaikinDevice], int]:
         if len(body) < 3:
             raise DaikinSocketError(f"Room info body too short: {body.hex()}")
         pos = 0
@@ -276,9 +299,9 @@ class DaikinSocketClient:
         for _ in range(room_count):
             room_id = struct.unpack_from("<H", body, pos)[0]
             pos += 2
-            room_type = body[pos]
+            version_flag = body[pos]
             pos += 1
-            if room_type != 2:
+            if version_flag != 2:
                 room_name, room_name_raw, pos = self._read_u8_text(body, pos)
                 room_alias, room_alias_raw, pos = self._read_u8_text(body, pos)
                 icon, icon_raw, pos = self._read_u8_text(body, pos)
@@ -286,41 +309,45 @@ class DaikinSocketClient:
                 room_name = room_alias = icon = ""
                 room_name_raw = room_alias_raw = icon_raw = b""
 
-            if room_type != 1:
-                group_count = struct.unpack_from("<H", body, pos)[0]
+            group_count = struct.unpack_from("<H", body, pos)[0]
+            pos += 2
+            for _group_index in range(group_count):
+                device_type = struct.unpack_from("<i", body, pos)[0]
+                pos += 4
+                device_count = struct.unpack_from("<H", body, pos)[0]
                 pos += 2
-                for _group_index in range(group_count):
-                    device_type = struct.unpack_from("<i", body, pos)[0]
-                    pos += 4
-                    device_count = struct.unpack_from("<H", body, pos)[0]
-                    pos += 2
-                    for unit in range(device_count):
+                for unit in range(device_count):
+                    if always_read_device_names or version_flag > 2:
                         device_name, device_name_raw, pos = self._read_u8_text(body, pos)
                         device_alias, device_alias_raw, pos = self._read_u8_text(body, pos)
-                        devices.append(
-                            DaikinDevice(
-                                gateway_id=self.gateway.id,
-                                gateway_name=self.gateway.name,
-                                room_id=room_id,
-                                room_name=room_name,
-                                room_alias=room_alias,
-                                device_type=device_type,
-                                device_type_name=self.DEVICE_NAMES.get(device_type, str(device_type)),
-                                unit=unit,
-                                name=device_name,
-                                alias=device_alias,
-                                raw={
-                                    "room_type": room_type,
-                                    "icon": icon,
-                                    "room_name_raw": room_name_raw.hex(),
-                                    "room_alias_raw": room_alias_raw.hex(),
-                                    "icon_raw": icon_raw.hex(),
-                                    "device_name_raw": device_name_raw.hex(),
-                                    "device_alias_raw": device_alias_raw.hex(),
-                                },
-                            )
+                    else:
+                        device_name = ""
+                        device_alias = room_alias
+                        device_name_raw = device_alias_raw = b""
+                    devices.append(
+                        DaikinDevice(
+                            gateway_id=self.gateway.id,
+                            gateway_name=self.gateway.name,
+                            room_id=room_id,
+                            room_name=room_name,
+                            room_alias=room_alias,
+                            device_type=device_type,
+                            device_type_name=self.DEVICE_NAMES.get(device_type, str(device_type)),
+                            unit=unit,
+                            name=device_name,
+                            alias=device_alias,
+                            raw={
+                                "room_version_flag": version_flag,
+                                "icon": icon,
+                                "room_name_raw": room_name_raw.hex(),
+                                "room_alias_raw": room_alias_raw.hex(),
+                                "icon_raw": icon_raw.hex(),
+                                "device_name_raw": device_name_raw.hex(),
+                                "device_alias_raw": device_alias_raw.hex(),
+                            },
                         )
-        return devices
+                    )
+        return devices, pos
 
     @staticmethod
     def parse_aircon_status(body: bytes) -> dict[str, Any]:
