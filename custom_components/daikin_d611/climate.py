@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
-from homeassistant.components.climate.const import HVACMode
+from homeassistant.components.climate.const import HVACAction, HVACMode
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 
-from .const import AIR_CON_TYPES, DOMAIN
+from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, DOMAIN, VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
 
@@ -23,6 +23,18 @@ MODE_TO_HVAC = {
     7: HVACMode.AUTO,
     8: HVACMode.HEAT,
     9: HVACMode.DRY,
+}
+MODE_TO_ACTION = {
+    0: HVACAction.COOLING,
+    1: HVACAction.DRYING,
+    2: HVACAction.FAN,
+    3: HVACAction.IDLE,
+    4: HVACAction.HEATING,
+    5: HVACAction.DRYING,
+    6: HVACAction.IDLE,
+    7: HVACAction.IDLE,
+    8: HVACAction.HEATING,
+    9: HVACAction.DRYING,
 }
 HVAC_TO_MODE = {
     HVACMode.COOL: 0,
@@ -39,6 +51,20 @@ FAN_MODES = {
     "最强": 4,
     "自动": 5,
 }
+TURN_ON_FEATURE = getattr(ClimateEntityFeature, "TURN_ON", 0)
+TURN_OFF_FEATURE = getattr(ClimateEntityFeature, "TURN_OFF", 0)
+
+
+def _first_number(status: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = status.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 async def async_setup_entry(hass, entry, async_add_entities) -> None:
@@ -59,7 +85,12 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
     _attr_target_temperature_step = 0.5
     _attr_min_temp = 16
     _attr_max_temp = 32
-    _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.FAN_MODE
+        | TURN_ON_FEATURE
+        | TURN_OFF_FEATURE
+    )
     _attr_hvac_modes = [
         HVACMode.OFF,
         HVACMode.COOL,
@@ -86,16 +117,32 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         return MODE_TO_HVAC.get(self.status.get("mode"), HVACMode.AUTO)
 
     @property
+    def hvac_action(self) -> HVACAction | None:
+        if self.status.get("switch", self.status.get("switches")) == 0:
+            return HVACAction.OFF
+        return MODE_TO_ACTION.get(self.status.get("mode"))
+
+    @property
     def target_temperature(self) -> float | None:
-        return self.status.get("target_temperature", self.status.get("temp"))
+        return _first_number(self.status, "target_temperature", "temp")
 
     @property
     def current_temperature(self) -> float | None:
-        return self.status.get("room_temperature", self.status.get("indoor_temperature"))
+        return self._room_status_number(
+            "room_temperature",
+            "indoor_temperature",
+            "current_temperature",
+            "local_sensor_temperature",
+            "sensor_temperature",
+            "local_temperature",
+            "composite_temperature",
+            "temperature",
+        )
 
     @property
     def current_humidity(self) -> int | None:
-        return self.status.get("humidity_percent")
+        value = self._room_status_number("humidity_percent", "local_humidity", "humidity")
+        return round(value) if value is not None else None
 
     @property
     def fan_mode(self) -> str | None:
@@ -116,6 +163,12 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
             values["mode"] = HVAC_TO_MODE[hvac_mode]
         await self.coordinator.async_control_device(self.device_id, **values)
 
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self.coordinator.async_control_device(self.device_id, switch=1)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self.coordinator.async_control_device(self.device_id, switch=0)
+
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
@@ -126,3 +179,16 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         if fan_mode not in FAN_MODES:
             return
         await self.coordinator.async_control_device(self.device_id, air_flow=FAN_MODES[fan_mode])
+
+    def _room_status_number(self, *keys: str) -> float | None:
+        if (value := _first_number(self.status, *keys)) is not None:
+            return value
+
+        for device in self.coordinator.data.values():
+            if device.unique_id == self.device_id or device.room_id != self.device.room_id:
+                continue
+            if device.device_type not in AIR_SENSOR_TYPES and device.device_type not in VAM_TYPES:
+                continue
+            if (value := _first_number(device.status, *keys)) is not None:
+                return value
+        return None
