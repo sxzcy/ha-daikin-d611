@@ -15,7 +15,6 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 
-from .api import compact_json
 from .const import (
     AIR_CON_TYPES,
     AIR_SENSOR_TYPES,
@@ -78,8 +77,12 @@ def _raw_status(device: DaikinDevice) -> str | None:
 
 def _raw_status_attrs(device: DaikinDevice) -> dict[str, Any]:
     physics = device.status.get("cloud_physics")
-    attributes = dict(physics) if isinstance(physics, dict) else {}
-    attributes["status_json"] = compact_json(device.status)
+    attributes: dict[str, Any] = {
+        "status_key_count": len(device.status),
+        "status_keys": sorted(device.status),
+    }
+    if isinstance(physics, dict):
+        attributes["cloud_physics_keys"] = sorted(physics)
     return attributes
 
 
