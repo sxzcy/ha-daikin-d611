@@ -10,7 +10,7 @@ import struct
 from typing import Any
 
 from .codec import DaikinSocketError, format_error
-from .const import AIR_CON_TYPES, DEVICE_TYPE_AIR_SENSOR, DEVICE_TYPE_MINI_VAM, VAM_TYPES
+from .const import AIR_CON_TYPES, DEVICE_TYPE_AIR_SENSOR, DEVICE_TYPE_HD, DEVICE_TYPE_MINI_VAM, GEOTHERMIC_TYPES, HD_TYPES, VAM_TYPES
 from .models import DaikinDevice, DaikinGateway
 from .protocol import (
     CMD_AIR_SENSOR_INFO_2,
@@ -22,6 +22,7 @@ from .protocol import (
     MAX_SYNC_SCAN_BYTES,
     build_air_sensor_query_frame,
     build_control_frame,
+    build_hd_control_frame,
     build_login_frame,
     build_minivam_composite_query_frame,
     build_room_info_frame,
@@ -31,8 +32,9 @@ from .protocol import (
     parse_air_sensor_status,
     parse_aircon_status,
     parse_frame,
+    parse_hd_status,
     parse_minivam_composite_status,
-    parse_room_info,
+    parse_room_info_packet,
     parse_vam_status,
 )
 
@@ -185,37 +187,63 @@ class DaikinLocalTransport:
             await self._async_send(writer, frame)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self.timeout
+            collected: list[DaikinDevice] = []
+            seen_keys: set[tuple[int, int, int]] = set()
+            expected_total = 0
+            rooms_seen = 0
+
             while (remaining := deadline - loop.time()) > 0:
+                read_timeout = min(self.PHASE_READ_TIMEOUT, remaining) if collected else remaining
                 try:
-                    message = await async_read_frame(reader, remaining)
+                    message = await async_read_frame(reader, read_timeout)
                 except TimeoutError:
                     break
                 if message.get("cmd") == "HEARTBEAT":
                     continue
                 inner = message.get("inner") if isinstance(message.get("inner"), dict) else message
                 if inner.get("cmd") in (CMD_GET_ROOM_INFO, CMD_GET_ROOM_INFO_V1):
-                    return parse_room_info(inner.get("body") or b"", gateway_id=self.gateway.id, gateway_name=self.gateway.name)
+                    total_rooms, frame_rooms, chunk = parse_room_info_packet(
+                        inner.get("body") or b"", gateway_id=self.gateway.id, gateway_name=self.gateway.name,
+                    )
+                    for dev in chunk:
+                        key = (dev.device_type, dev.room_id, dev.unit)
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            collected.append(dev)
+                    expected_total = max(expected_total, total_rooms)
+                    rooms_seen += frame_rooms
+                    if expected_total <= 0 or frame_rooms <= 0 or rooms_seen >= expected_total:
+                        return collected
+            if collected:
+                return collected
         raise DaikinSocketError("Room info timed out")
 
     async def async_query_statuses(self, devices: list[DaikinDevice]) -> dict[str, dict[str, Any]]:
-        """Query local statuses for Aircon, VAM/Mini-VAM, and AirSensor devices."""
+        """Query local statuses for Aircon, VAM/Mini-VAM, HD, Geothermic, and AirSensor devices."""
         statuses: dict[str, dict[str, Any]] = {}
+        query_types = AIR_CON_TYPES | VAM_TYPES | HD_TYPES | GEOTHERMIC_TYPES
         async with self._open_session() as (reader, writer):
             pending: dict[int, tuple[int, DaikinDevice]] = {}
             for dev in devices:
-                if dev.device_type not in AIR_CON_TYPES and dev.device_type not in VAM_TYPES:
+                if dev.device_type not in query_types:
                     continue
                 inner_id = self._next_id()
                 cmd, frame = build_status_query_frame(
                     inner_request_id=inner_id, outer_request_id=self._next_id(),
-                    device_type=dev.device_type, room_id=dev.room_id, terminal_type=self.gateway.terminal_type,
+                    device_type=dev.device_type, room_id=dev.room_id,
+                    terminal_type=self.gateway.terminal_type, unit=dev.unit,
                 )
                 pending[inner_id] = (cmd, dev)
                 await self._async_send(writer, frame)
 
-            def _on_primary(dev: DaikinDevice, _cmd: int, body: bytes) -> None:
+            def _on_primary(dev: DaikinDevice, cmd: int, body: bytes) -> None:
                 try:
-                    statuses[dev.unique_id] = parse_aircon_status(body) if dev.device_type in AIR_CON_TYPES else parse_vam_status(body)
+                    if dev.device_type in AIR_CON_TYPES or dev.device_type in GEOTHERMIC_TYPES:
+                        statuses[dev.unique_id] = parse_aircon_status(body)
+                    elif dev.device_type in HD_TYPES:
+                        statuses[dev.unique_id] = parse_hd_status(body, cmd=cmd)
+                    else:
+                        statuses[dev.unique_id] = parse_vam_status(body)
                 except Exception:
                     _LOGGER.debug("Failed to parse status for %s", dev.unique_id, exc_info=True)
 
@@ -227,7 +255,7 @@ class DaikinLocalTransport:
                     continue
                 inner_id = self._next_id()
                 cmd, frame = build_minivam_composite_query_frame(
-                    inner_request_id=inner_id, outer_request_id=self._next_id(), room_id=dev.room_id,
+                    inner_request_id=inner_id, outer_request_id=self._next_id(), room_id=dev.room_id, unit=dev.unit,
                 )
                 comp_pending[inner_id] = (cmd, dev)
                 await self._async_send(writer, frame)
@@ -276,16 +304,29 @@ class DaikinLocalTransport:
         mode: int | None = None,
         air_flow: int | None = None,
         temperature: float | None = None,
+        fan_direction1: int | None = None,
+        fan_direction2: int | None = None,
+        breathe: int | None = None,
+        mute: int | None = None,
+        warm_temperature: float | None = None,
         ack_timeout: float = 3.0,
     ) -> dict[str, Any]:
         """Send a control command and optionally wait for gateway ACK."""
         async with self._open_session() as (reader, writer):
             inner_id = self._next_id()
-            cmd, frame = build_control_frame(
-                inner_request_id=inner_id, outer_request_id=self._next_id(),
-                device_type=device.device_type, room_id=device.room_id,
-                switch=switch, mode=mode, air_flow=air_flow, temperature=temperature,
-            )
+            if device.device_type == DEVICE_TYPE_HD:
+                cmd, frame = build_hd_control_frame(
+                    inner_request_id=inner_id, outer_request_id=self._next_id(),
+                    room_id=device.room_id, unit=device.unit,
+                    switch=switch, mute=mute, warm_temperature=warm_temperature,
+                )
+            else:
+                cmd, frame = build_control_frame(
+                    inner_request_id=inner_id, outer_request_id=self._next_id(),
+                    device_type=device.device_type, room_id=device.room_id, unit=device.unit,
+                    switch=switch, mode=mode, air_flow=air_flow, temperature=temperature,
+                    fan_direction1=fan_direction1, fan_direction2=fan_direction2, breathe=breathe,
+                )
             await self._async_send(writer, frame)
             if ack_timeout <= 0:
                 return {"result": "sent_no_ack_configured"}

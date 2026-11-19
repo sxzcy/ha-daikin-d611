@@ -8,7 +8,7 @@ from homeassistant.components.fan import FanEntity, FanEntityFeature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import VAM_TYPES
+from .const import DEVICE_TYPE_AIR_CON_BATHROOM, VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
 from .mappings import VAM_MODES, VAM_MODE_VALUES
@@ -28,11 +28,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up Daikin D611 fan entities."""
     coordinator = entry.runtime_data
-    async_add_entities(
-        DaikinD611Fan(coordinator, device_id)
-        for device_id, device in coordinator.data.items()
-        if device.device_type in VAM_TYPES
-    )
+    entities: list[FanEntity] = []
+    for device_id, device in coordinator.data.items():
+        if device.device_type in VAM_TYPES:
+            entities.append(DaikinD611Fan(coordinator, device_id))
+        elif device.device_type == DEVICE_TYPE_AIR_CON_BATHROOM:
+            entities.append(DaikinD611BathroomFan(coordinator, device_id))
+    async_add_entities(entities)
 
 
 class DaikinD611Fan(DaikinD611Entity, FanEntity):
@@ -99,3 +101,45 @@ class DaikinD611Fan(DaikinD611Entity, FanEntity):
         if percentage <= 75:
             return 3
         return 4
+
+
+class DaikinD611BathroomFan(DaikinD611Entity, FanEntity):
+    """Daikin bathroom exhaust fan controlling breathe (0=off, 1=low/50%, 2=high/100%)."""
+
+    _attr_supported_features = FanEntityFeature.SET_SPEED | TURN_ON_FEATURE | TURN_OFF_FEATURE
+    _attr_speed_count = 2
+
+    def __init__(self, coordinator: DaikinD611Coordinator, device_id: str) -> None:
+        super().__init__(coordinator, device_id)
+        self._attr_name = "换气"
+        self._attr_unique_id = f"{self.entity_unique_id}_exhaust_fan"
+
+    @property
+    def is_on(self) -> bool | None:
+        breathe = self.device.status.get("breathe")
+        return None if breathe is None else breathe != 0
+
+    @property
+    def percentage(self) -> int | None:
+        breathe = self.device.status.get("breathe")
+        if breathe == 1:
+            return 50
+        if breathe == 2:
+            return 100
+        if breathe == 0:
+            return 0
+        return None
+
+    async def async_turn_on(self, percentage: int | None = None, **kwargs: Any) -> None:
+        breathe = 2 if (percentage is not None and percentage > 50) else 1
+        await self._async_control_device(breathe=breathe)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_control_device(breathe=0)
+
+    async def async_set_percentage(self, percentage: int) -> None:
+        if percentage <= 0:
+            await self.async_turn_off()
+            return
+        breathe = 2 if percentage > 50 else 1
+        await self._async_control_device(breathe=breathe)

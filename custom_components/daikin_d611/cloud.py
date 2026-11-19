@@ -29,14 +29,18 @@ from .codec import (
     to_int,
     to_list,
 )
-from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, VAM_TYPES
+from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, DEVICE_TYPE_AIR_CON, DEVICE_TYPE_AIR_SENSOR, DEVICE_TYPE_GEOTHERMIC, DEVICE_TYPE_HD, DEVICE_TYPE_MINI_VAM, DEVICE_TYPE_VAM, GEOTHERMIC_TYPES, HD_TYPES, VAM_TYPES
 from .models import DaikinDevice, DaikinGateway
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://newlifemulti.daikin-china.com.cn:4443/v2/"
 CERT_INFO_URL = "https://newlifemulti.daikin-china.com.cn:443/v2/home/getCertificateInfo"
+POWER_DATA_WEB_URL = "https://newlifemulti.daikin-china.com.cn/v2/web/getHomePowerData"
+POWER_DATA_REFERER = "https://newlifemulti.daikin-china.com.cn/daikinStaticWeb/powerconsumptionV2/index_home.html"
 USER_AGENT = "DaikinINLS/4.9.0 HomeAssistant"
+POWER_WEB_USER_AGENT = "Mozilla/5.0 (Linux; Android 12; Mobile) Daikin/4.9.0 INLS"
+MAX_PAGINATION_PAGES = 50
 PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAm6hQn1LlnQ0DzG0ZiKUP
 hNHUUJeFCgw5m/sUPkbOpgwui5Br6OQkrW/+yKeHn6gRLWNqW0+ULha/9lhWWUJm
@@ -331,24 +335,192 @@ class DaikinCloudClient:
                     await self._async_login_locked()
             return await self._async_request(endpoint, form=form, body=body)
 
+    @staticmethod
+    def _extract_list_and_total(data: Any) -> tuple[list[dict[str, Any]], int | None, bool]:
+        if isinstance(data, list):
+            return [i for i in data if isinstance(i, dict)], None, False
+        if not isinstance(data, dict):
+            return [], None, False
+        for key in ("list", "records", "rows", "items", "data"):
+            if isinstance(data.get(key), list):
+                items = [i for i in data[key] if isinstance(i, dict)]
+                total = to_int(first_value(data.get("total"), data.get("totalCount")))
+                pages = to_int(first_value(data.get("pages"), data.get("totalPages")))
+                page_num = to_int(first_value(data.get("pageNum"), data.get("pageNo"), data.get("page"), data.get("current")))
+                has_more = bool(data.get("hasMore") or data.get("hasNextPage")) or (
+                    pages is not None and page_num is not None and page_num < pages
+                )
+                return items, total, has_more
+        return [], None, False
+
+    async def _async_request_paginated_list(
+        self, endpoint: str, *, base_body: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        first = await self._async_request_authenticated(endpoint, body=base_body)
+        items, total, has_more = self._extract_list_and_total(first)
+        if not items or (not has_more and (total is None or len(items) >= total)):
+            return items
+        collected = list(items)
+        page = 2
+        while page <= MAX_PAGINATION_PAGES:
+            if total is not None and len(collected) >= total:
+                break
+            req_body = {**(base_body or {}), "pageNum": page, "pageNo": page, "pageSize": len(items)}
+            nxt = await self._async_request_authenticated(endpoint, body=req_body)
+            page_items, _nxt_total, nxt_more = self._extract_list_and_total(nxt)
+            if not page_items:
+                break
+            collected.extend(page_items)
+            if not nxt_more and (total is None or len(collected) >= total) and len(page_items) < len(items):
+                break
+            page += 1
+        return collected
+
     async def async_list_homes(self) -> list[dict[str, Any]]:
-        return [i for i in to_list(await self._async_request_authenticated("home/listHomeByLoginUser")) if isinstance(i, dict)]
+        return await self._async_request_paginated_list("home/listHomeByLoginUser")
 
     async def async_get_home(self, home_id: str) -> dict[str, Any]:
         data = await self._async_request_authenticated("home/getHome", body={"homeId": home_id})
         return data if isinstance(data, dict) else {}
 
     async def async_list_gateways(self, home_id: str) -> list[dict[str, Any]]:
-        data = await self._async_request_authenticated("home/listGatewayAuth", body={"homeId": home_id})
-        return [i for i in to_list(data) if isinstance(i, dict)]
+        return await self._async_request_paginated_list("home/listGatewayAuth", base_body={"homeId": home_id})
 
     async def async_get_user_info(self) -> dict[str, Any]:
         data = await self._async_request_authenticated("home/getUserInfo")
         return data if isinstance(data, dict) else {}
 
+    async def async_get_power_consumption_url(self, home_id: int | str, user_type: str = "1") -> str:
+        """Fetch the H5 power consumption URL containing encryptNlcId."""
+        normalized_home_id: int | str = int(home_id) if str(home_id).isdigit() else str(home_id)
+        data = await self._async_request_authenticated(
+            "home/getHomePowerDataUrl",
+            body={"homeId": normalized_home_id, "userType": str(user_type)},
+        )
+        if not isinstance(data, dict) or not data.get("url"):
+            raise DaikinApiError(f"Power consumption URL missing: {compact_json(data)}")
+        return str(data["url"])
+
+    @staticmethod
+    def extract_nlc_id_from_url(power_url: str) -> str | None:
+        """Extract nlcId / encryptNlcId from the Daikin power consumption H5 URL."""
+        query_params = parse.parse_qs(parse.urlparse(power_url).query)
+        for key in ("nlcId", "encryptNlcId"):
+            if query_params.get(key):
+                return str(query_params[key][0])
+        return None
+
+    async def async_get_home_power_data(
+        self,
+        *,
+        home_id: int | str,
+        year: int,
+        month: int,
+        encrypt_nlc_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch monthly and daily power consumption data purely asynchronously."""
+        if not encrypt_nlc_id:
+            power_url = await self.async_get_power_consumption_url(home_id)
+            encrypt_nlc_id = self.extract_nlc_id_from_url(power_url)
+            if not encrypt_nlc_id:
+                raise DaikinApiError("Could not extract nlcId from power consumption URL")
+
+        normalized_home_id: int | str = int(home_id) if str(home_id).isdigit() else str(home_id)
+        form_bytes = parse.urlencode({
+            "encryptNlcId": str(encrypt_nlc_id),
+            "homeId": normalized_home_id,
+            "year": int(year),
+            "month": int(month),
+        }).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent": POWER_WEB_USER_AGENT,
+            "Referer": POWER_DATA_REFERER,
+        }
+        async with AsyncExitStack() as stack:
+            session = self._bootstrap_session or await stack.enter_async_context(
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout))
+            )
+            try:
+                async with session.post(
+                    POWER_DATA_WEB_URL,
+                    data=form_bytes,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                ) as resp:
+                    raw = (await resp.read()).decode("utf-8", errors="replace")
+                    if resp.status >= 400:
+                        raise DaikinApiError(f"Power data HTTP {resp.status}: {raw[:500]}")
+            except DaikinApiError:
+                raise
+            except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+                raise DaikinApiError(f"Power data request failed: {format_error(exc)}") from exc
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise DaikinApiError(f"Invalid power data JSON: {raw[:500]}") from exc
+        if not isinstance(payload, dict) or payload.get("code") not in (0, "0", None):
+            msg = str(first_value((payload or {}).get("description"), (payload or {}).get("message"), (payload or {}).get("code")))
+            raise DaikinApiError(f"Power data API failed: {msg}")
+        data = payload.get("data")
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _merge_snapshot_pages(base: dict[str, Any], extra: dict[str, Any]) -> bool:
+        added = False
+        for key in ("ipbox", "indoor", "vam", "mini_vam", "sensor", "hd", "geothermic", "floor_heating"):
+            extra_items = [i for i in to_list(extra.get(key)) if isinstance(i, dict)]
+            if not extra_items:
+                continue
+            cur = [i for i in to_list(base.get(key)) if isinstance(i, dict)]
+            seen = {str(i.get("key")) for i in cur if i.get("key")}
+            for item in extra_items:
+                item_key = str(item.get("key") or "")
+                if item_key and item_key in seen:
+                    continue
+                if item_key:
+                    seen.add(item_key)
+                cur.append(item)
+                added = True
+            base[key] = cur
+        return added
+
+    @staticmethod
+    def _snapshot_has_more(data: dict[str, Any]) -> bool:
+        if bool(data.get("hasMore") or data.get("hasNextPage")):
+            return True
+        total = to_int(first_value(data.get("total"), data.get("totalCount")))
+        pages = to_int(first_value(data.get("pages"), data.get("totalPages")))
+        page_num = to_int(first_value(data.get("pageNum"), data.get("pageNo"), data.get("page"), data.get("current")))
+        if pages is not None and page_num is not None and page_num < pages:
+            return True
+        if total is not None:
+            count = sum(
+                len(to_list(data.get(k)))
+                for k in ("indoor", "vam", "mini_vam", "sensor", "hd", "geothermic", "floor_heating")
+            )
+            return count < total
+        return False
+
     async def async_get_ipbox_snapshot(self, terminal_mac_or_key: str) -> dict[str, Any]:
         data = await self._async_request_authenticated("snapshot/ipbox/getFullSub", body={"terminalMac": terminal_mac_or_key})
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        merged = copy.deepcopy(data)
+        page = 2
+        while page <= MAX_PAGINATION_PAGES and self._snapshot_has_more(merged):
+            nxt = await self._async_request_authenticated(
+                "snapshot/ipbox/getFullSub",
+                body={"terminalMac": terminal_mac_or_key, "pageNum": page, "pageNo": page},
+            )
+            if not isinstance(nxt, dict) or not self._merge_snapshot_pages(merged, nxt):
+                break
+            if not self._snapshot_has_more(nxt):
+                break
+            page += 1
+        return merged
 
     async def async_discover_gateway(
         self, query: str, *, host_override: str | None = None, port_override: int | None = None,
@@ -403,7 +575,8 @@ _CLOUD_FLOAT_KEYS = ("temp", "target_temperature", "sensor_temperature", "humidi
 
 
 def _norm_key(value: Any) -> str:
-    return str(value or "").replace(":", "").replace("-", "").casefold()
+    text = str(value or "").strip().replace(":", "").replace("-", "").casefold()
+    return text.removeprefix("0x")
 
 
 def _cloud_bool(value: Any) -> bool | None:
@@ -428,26 +601,49 @@ def _cloud_float(value: Any) -> float | Any:
         return value
 
 
+def _item_unique_token(item: dict[str, Any]) -> str | None:
+    physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
+    raw = first_value(item.get("key"), physics.get("serial_no"), physics.get("device_no"), physics.get("mac"))
+    return str(raw) if raw not in (None, "") else None
+
+
 def _match_cloud_item(
     device: DaikinDevice,
     indoor: list[dict[str, Any]],
     vam: list[dict[str, Any]],
     sensors: list[dict[str, Any]],
+    *,
+    hd: list[dict[str, Any]] = (),
+    geothermic: list[dict[str, Any]] = (),
+    used_tokens: set[str] | None = None,
 ) -> dict[str, Any] | None:
     candidates = (
         indoor if device.device_type in AIR_CON_TYPES
         else vam if device.device_type in VAM_TYPES
         else sensors if device.device_type in AIR_SENSOR_TYPES
+        else hd if device.device_type in HD_TYPES
+        else geothermic if device.device_type in GEOTHERMIC_TYPES
         else ()
     )
+    used = used_tokens if used_tokens is not None else set()
+    available = [item for item in candidates if (_item_unique_token(item) not in used)]
     dev_key, dev_alias = _norm_key(device.name), _norm_key(device.alias)
-    for item in candidates:
+
+    # Pass 1: exact hardware identity / name / alias match
+    for item in available:
         physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
-        if to_int(physics.get("socket_room_id")) == device.room_id or to_int(physics.get("center_address")) == device.room_id - 1:
-            return item
         hay = " ".join(_norm_key(p) for p in (item.get("key"), physics.get("serial_no"), physics.get("mac"), physics.get("device_no")))
         if (dev_key and dev_key in hay) or (dev_alias and dev_alias in hay):
             return item
+
+    # Pass 2: room_id match (pick unit-th match if multiple items share the same room)
+    room_matches = []
+    for item in available:
+        physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
+        if to_int(physics.get("socket_room_id")) == device.room_id or to_int(physics.get("center_address")) == device.room_id - 1:
+            room_matches.append(item)
+    if room_matches:
+        return room_matches[device.unit] if device.unit < len(room_matches) else room_matches[0]
     return None
 
 
@@ -462,21 +658,29 @@ def parse_cloud_snapshot(
         for ipbox in snapshot.get("ipbox", []) if isinstance(ipbox, dict)
         for sub in ipbox.get("sub", []) if isinstance(sub, dict) and sub.get("device_key")
     }
-    indoor = [i for i in snapshot.get("indoor", []) if isinstance(i, dict)]
+    indoor = [i for i in to_list(snapshot.get("indoor")) if isinstance(i, dict)]
     vam = [i for i in to_list(snapshot.get("mini_vam")) + to_list(snapshot.get("vam")) if isinstance(i, dict)]
-    sensors = [i for i in snapshot.get("sensor", []) if isinstance(i, dict)]
+    sensors = [i for i in to_list(snapshot.get("sensor")) if isinstance(i, dict)]
+    hd = [i for i in to_list(snapshot.get("hd")) if isinstance(i, dict)]
+    geothermic = [i for i in to_list(snapshot.get("geothermic")) + to_list(snapshot.get("floor_heating")) if isinstance(i, dict)]
 
     extracted: dict[str, dict[str, Any]] = {}
+    used_tokens: set[str] = set()
     for device in devices:
-        item = _match_cloud_item(device, indoor, vam, sensors)
+        item = _match_cloud_item(
+            device, indoor, vam, sensors, hd=hd, geothermic=geothermic, used_tokens=used_tokens,
+        )
         if item is None:
             continue
+        if (tok := _item_unique_token(item)) is not None:
+            used_tokens.add(tok)
         online = item.get("online")
         if online is None and item.get("key") in online_by_key:
             online = online_by_key[str(item["key"])]
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
         filters = item.get("filter") if isinstance(item.get("filter"), dict) else {}
+        capability = item.get("capability") if isinstance(item.get("capability"), dict) else {}
         cloud: dict[str, Any] = {
             **status,
             "cloud_key": item.get("key"),
@@ -485,6 +689,8 @@ def parse_cloud_snapshot(
             "last_cloud_refresh": refreshed_at,
             "cloud_source": "snapshot",
         }
+        if capability:
+            cloud["cloud_capability"] = copy.deepcopy(capability)
         if item.get("key") and str(item["key"]).startswith("SENSOR:"):
             cloud["sensor_temperature"] = cloud.get("temp")
         elif "temp" in cloud:
@@ -493,6 +699,10 @@ def parse_cloud_snapshot(
             cloud["switch"] = cloud["switches"]
         if "volume" in cloud:
             cloud["air_flow"] = cloud["volume"]
+        if "direction1" in cloud and "fan_direction1" not in cloud:
+            cloud["fan_direction1"] = cloud["direction1"]
+        if "direction2" in cloud and "fan_direction2" not in cloud:
+            cloud["fan_direction2"] = cloud["direction2"]
         for key, value in filters.items():
             cloud[f"filter_{key.removeprefix('filter_')}"] = value
         for key in _CLOUD_INT_KEYS:
@@ -506,3 +716,71 @@ def parse_cloud_snapshot(
                 cloud[key] = first_value(_cloud_bool(cloud[key]), cloud[key])
         extracted[device.unique_id] = cloud
     return extracted
+
+
+def synthesize_missing_cloud_devices(
+    snapshot: dict[str, Any],
+    existing_devices: list[DaikinDevice],
+    gateway: DaikinGateway,
+) -> list[DaikinDevice]:
+    """Build fallback DaikinDevice objects for cloud snapshot items absent from local room info."""
+    indoor = [i for i in to_list(snapshot.get("indoor")) if isinstance(i, dict)]
+    vam = [i for i in to_list(snapshot.get("mini_vam")) + to_list(snapshot.get("vam")) if isinstance(i, dict)]
+    sensors = [i for i in to_list(snapshot.get("sensor")) if isinstance(i, dict)]
+    hd = [i for i in to_list(snapshot.get("hd")) if isinstance(i, dict)]
+    geothermic = [i for i in to_list(snapshot.get("geothermic")) + to_list(snapshot.get("floor_heating")) if isinstance(i, dict)]
+
+    used_tokens: set[str] = set()
+    for dev in existing_devices:
+        matched = _match_cloud_item(dev, indoor, vam, sensors, hd=hd, geothermic=geothermic, used_tokens=used_tokens)
+        if matched is not None and (tok := _item_unique_token(matched)) is not None:
+            used_tokens.add(tok)
+
+    existing_keys = {(d.device_type, d.room_id, d.unit) for d in existing_devices}
+    extras: list[DaikinDevice] = []
+    buckets: list[tuple[list[dict[str, Any]], int, str]] = [
+        (indoor, DEVICE_TYPE_AIR_CON, "AIR_CON"),
+        ([i for i in to_list(snapshot.get("mini_vam")) if isinstance(i, dict)], DEVICE_TYPE_MINI_VAM, "MINI_VAM"),
+        ([i for i in to_list(snapshot.get("vam")) if isinstance(i, dict)], DEVICE_TYPE_VAM, "VAM"),
+        (sensors, DEVICE_TYPE_AIR_SENSOR, "AIR_SENSOR"),
+        (hd, DEVICE_TYPE_HD, "HD"),
+        (geothermic, DEVICE_TYPE_GEOTHERMIC, "GEOTHERMIC"),
+    ]
+    next_room_counters: dict[tuple[int, int], int] = {}
+    for items, default_type, default_type_name in buckets:
+        for idx, item in enumerate(items):
+            tok = _item_unique_token(item)
+            if tok and tok in used_tokens:
+                continue
+            physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
+            room_id = to_int(physics.get("socket_room_id"))
+            if room_id is None and (ca := to_int(physics.get("center_address"))) is not None:
+                room_id = ca + 1
+            if room_id is None:
+                if default_type != DEVICE_TYPE_AIR_SENSOR:
+                    continue
+                room_id = 100 + idx
+            unit = next_room_counters.get((default_type, room_id), 0)
+            while (default_type, room_id, unit) in existing_keys:
+                unit += 1
+            next_room_counters[(default_type, room_id)] = unit + 1
+            existing_keys.add((default_type, room_id, unit))
+            if tok:
+                used_tokens.add(tok)
+            name = str(first_value(physics.get("name"), physics.get("mac"), item.get("key"), ""))
+            extras.append(
+                DaikinDevice(
+                    gateway_id=gateway.id,
+                    gateway_name=gateway.name,
+                    room_id=room_id,
+                    room_name=name,
+                    room_alias=name,
+                    device_type=default_type,
+                    device_type_name=default_type_name,
+                    unit=unit,
+                    name=str(first_value(physics.get("mac"), physics.get("serial_no"), item.get("key"), name)),
+                    alias=name,
+                    raw={"cloud_synthesized": True, "cloud_key": item.get("key")},
+                )
+            )
+    return extras

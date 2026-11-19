@@ -14,8 +14,10 @@ Mini VAM / VAM fresh-air devices, and sensors.
 - UI setup through Home Assistant config flow.
 - Daikin cloud login for gateway discovery and socket parameters.
 - Local socket polling after setup.
-- Indoor air conditioners as `climate` entities.
-- VAM / Mini VAM fresh-air devices as `fan` entities.
+- Indoor air conditioners as `climate` entities (with vertical & horizontal swing when supported).
+- VAM / Mini VAM fresh-air devices as `fan` entities, plus outdoor humidity & PM2.5 sensors for Mini VAM.
+- Bathroom AC exhaust fans as `fan` entities and HD water heat exchangers as `water_heater` + mute `switch` entities.
+- Cloud power consumption sensors (yesterday / current month kWh) with Energy Dashboard statistics import and `daikin_d611.get_power_data` service.
 - Temperature, CO2, PM2.5, humidity, raw status, refresh, and control-result
   sensors.
 - Online, power, problem, and optional raw snapshot binary sensors.
@@ -87,8 +89,7 @@ with the gateway address shown by your router or by Daikin app traffic.
   diagnostic attributes where practical.
 - New installations use stable physical IDs by default. Existing installations
   can toggle this option to migrate from room-based legacy IDs.
-- This project is independent from `ha-dsair`, which targets older
-  DTA117B611/DTA117C611 style devices.
+- This project is independent from `ha-dsair` (which primarily uses unauthenticated local port `8008` connections). `daikin_d611` uses Daikin New Life Multi cloud discovery (`nlcId`) and `CMD_LOGIN` / `CMD_TRANSFER` over pure `asyncio`.
 
 ## Public Release Hygiene
 

@@ -46,7 +46,8 @@
           "enable_cloud_snapshot": "Use cloud snapshot as supplemental state",
           "state_priority": "State priority",
           "enable_diagnostic_entities": "Create diagnostic entities",
-          "use_stable_ids": "Use stable physical IDs"
+          "use_stable_ids": "Use stable physical IDs",
+          "enable_power_statistics": "Enable cloud power consumption sensors"
         },
         "data_description": {
           "use_stable_ids": "Uses stable physical IDs when the gateway/cloud payload exposes them. Existing entries can migrate legacy entity unique IDs on reload."

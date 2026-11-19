@@ -13,7 +13,16 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
-from .mappings import AIRCON_FAN, AIRCON_FAN_VALUES
+from .mappings import (
+    AIRCON_FAN,
+    AIRCON_FAN_VALUES,
+    FAN_DIRECTION_HORIZONTAL,
+    FAN_DIRECTION_HORIZONTAL_OPTIONS,
+    FAN_DIRECTION_HORIZONTAL_VALUES,
+    FAN_DIRECTION_VERTICAL,
+    FAN_DIRECTION_VERTICAL_OPTIONS,
+    FAN_DIRECTION_VERTICAL_VALUES,
+)
 
 if TYPE_CHECKING:
     from . import DaikinD611ConfigEntry
@@ -51,6 +60,8 @@ HVAC_TO_MODE: dict[HVACMode, int] = {
 }
 TURN_ON_FEATURE = getattr(ClimateEntityFeature, "TURN_ON", 0)
 TURN_OFF_FEATURE = getattr(ClimateEntityFeature, "TURN_OFF", 0)
+SWING_MODE_FEATURE = getattr(ClimateEntityFeature, "SWING_MODE", 0)
+SWING_HORIZONTAL_MODE_FEATURE = getattr(ClimateEntityFeature, "SWING_HORIZONTAL_MODE", 0)
 
 
 def _first_number(status: dict[str, Any], *keys: str) -> float | None:
@@ -101,6 +112,8 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         HVACMode.AUTO,
     ]
     _attr_fan_modes = list(AIRCON_FAN_VALUES)
+    _attr_swing_modes = FAN_DIRECTION_VERTICAL_OPTIONS
+    _attr_swing_horizontal_modes = FAN_DIRECTION_HORIZONTAL_OPTIONS
 
     def __init__(self, coordinator: DaikinD611Coordinator, device_id: str) -> None:
         super().__init__(coordinator, device_id)
@@ -110,6 +123,30 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
     @property
     def status(self) -> dict[str, Any]:
         return self.device.status
+
+    @property
+    def supported_features(self) -> ClimateEntityFeature:
+        flags = (
+            ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.FAN_MODE
+            | TURN_ON_FEATURE
+            | TURN_OFF_FEATURE
+        )
+        cap = self.status.get("cloud_capability")
+        cap_dict = cap if isinstance(cap, dict) else {}
+        if (cap_dict.get("direction1") or 0) > 0 or (self.status.get("fan_direction1") or 0) > 0:
+            flags |= SWING_MODE_FEATURE
+        if (cap_dict.get("direction2") or 0) > 0 or (self.status.get("fan_direction2") or 0) > 0:
+            flags |= SWING_HORIZONTAL_MODE_FEATURE
+        return flags
+
+    @property
+    def swing_mode(self) -> str | None:
+        return FAN_DIRECTION_VERTICAL.get(self.status.get("fan_direction1"))
+
+    @property
+    def swing_horizontal_mode(self) -> str | None:
+        return FAN_DIRECTION_HORIZONTAL.get(self.status.get("fan_direction2"))
 
     @property
     def hvac_mode(self) -> HVACMode:
@@ -177,6 +214,16 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         if fan_mode not in AIRCON_FAN_VALUES:
             return
         await self._async_control_device(air_flow=AIRCON_FAN_VALUES[fan_mode])
+
+    async def async_set_swing_mode(self, swing_mode: str) -> None:
+        if swing_mode not in FAN_DIRECTION_VERTICAL_VALUES:
+            return
+        await self._async_control_device(fan_direction1=FAN_DIRECTION_VERTICAL_VALUES[swing_mode])
+
+    async def async_set_swing_horizontal_mode(self, swing_horizontal_mode: str) -> None:
+        if swing_horizontal_mode not in FAN_DIRECTION_HORIZONTAL_VALUES:
+            return
+        await self._async_control_device(fan_direction2=FAN_DIRECTION_HORIZONTAL_VALUES[swing_horizontal_mode])
 
     def _room_status_number(self, *keys: str) -> float | None:
         if (value := _first_number(self.status, *keys)) is not None:

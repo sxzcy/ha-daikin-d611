@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import copy
 from datetime import datetime, timedelta, timezone
 import logging
@@ -15,22 +16,26 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .cloud import DaikinCloudClient, parse_cloud_snapshot
+from .cloud import DaikinCloudClient, parse_cloud_snapshot, synthesize_missing_cloud_devices
 from .codec import DaikinAuthError, DaikinError, first_value, format_error, to_int
 from .const import (
     AIR_CON_TYPES,
     CONF_CONTROL_ACK_TIMEOUT,
     CONF_ENABLE_CLOUD_SNAPSHOT,
+    CONF_ENABLE_POWER_STATISTICS,
     CONF_GATEWAY,
     CONF_STATE_PRIORITY,
     CONF_TIMEOUT,
     DEFAULT_CONTROL_ACK_TIMEOUT,
     DEFAULT_ENABLE_CLOUD_SNAPSHOT,
+    DEFAULT_ENABLE_POWER_STATISTICS,
     DEFAULT_GATEWAY,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_STATE_PRIORITY,
     DEFAULT_TIMEOUT,
     DOMAIN,
+    GEOTHERMIC_TYPES,
+    HD_TYPES,
     STATE_PRIORITY_LOCAL_FIRST,
     VAM_TYPES,
 )
@@ -50,6 +55,7 @@ SOURCE_METADATA_KEYS = frozenset({
 })
 
 CLOUD_SNAPSHOT_INTERVAL = timedelta(minutes=10)
+POWER_REFRESH_INTERVAL = timedelta(hours=6)
 WARNING_COOLDOWN = timedelta(minutes=5)
 DELAYED_REFRESH_SECONDS = 15
 FAILURE_GRACE_THRESHOLD = 3
@@ -57,6 +63,24 @@ FAILURE_GRACE_THRESHOLD = 3
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _ensure_unique_stable_ids(devices: dict[str, DaikinDevice]) -> None:
+    """Disambiguate colliding stable_physical_id values across devices."""
+    counts = Counter(dev.stable_physical_id for dev in devices.values())
+    if all(count == 1 for count in counts.values()):
+        return
+    used: set[str] = set()
+    for dev in devices.values():
+        base = dev.stable_physical_id
+        if counts[base] == 1 and base not in used:
+            used.add(base)
+            continue
+        candidate = f"{base}_{dev.room_id}_{dev.unit}"
+        if candidate in used:
+            candidate = f"{candidate}_{dev.device_type}"
+        dev.stable_id = candidate
+        used.add(candidate)
 
 
 class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
@@ -72,6 +96,10 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         self._failure_grace_threshold = FAILURE_GRACE_THRESHOLD
         self._cached_devices: list[DaikinDevice] | None = None
         self._last_cloud_snapshot_at: datetime | None = None
+        self._last_power_refresh_at: datetime | None = None
+        self._power_refresh_date: tuple[int, int, int] | None = None
+        self.power_data: dict[str, Any] = {}
+        self.month_statistic_id: str | None = None
         self._last_warning_at: dict[str, datetime] = {}
         self._poll_timeout = max(1.0, float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT)))
         self.cloud = DaikinCloudClient(
@@ -183,6 +211,13 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
         if not snapshot:
             return False
 
+        missing = synthesize_missing_cloud_devices(snapshot, devices, gateway)
+        if missing:
+            devices.extend(missing)
+            if self._cached_devices is not None:
+                seen_cached = {d.unique_id for d in self._cached_devices}
+                self._cached_devices.extend(d.clone(status={}, available=True) for d in missing if d.unique_id not in seen_cached)
+
         preserve = str(self._option(CONF_STATE_PRIORITY, DEFAULT_STATE_PRIORITY)) == STATE_PRIORITY_LOCAL_FIRST
         for dev_id, cloud_status in parse_cloud_snapshot(snapshot, devices, _utc_now_iso()).items():
             cloud_status["state_sources"] = self._source_map(cloud_status, "cloud")
@@ -193,9 +228,147 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             )
         return True
 
+    def _power_refresh_due(self) -> bool:
+        if not bool(self._option(CONF_ENABLE_POWER_STATISTICS, DEFAULT_ENABLE_POWER_STATISTICS)):
+            return False
+        now = datetime.now(timezone.utc)
+        today = now.astimezone().date()
+        date_tuple = (today.year, today.month, today.day)
+        return (
+            self._last_power_refresh_at is None
+            or self._power_refresh_date != date_tuple
+            or now - self._last_power_refresh_at >= POWER_REFRESH_INTERVAL
+        )
+
+    @staticmethod
+    def _iter_daily_consumptions(consumptions: list[Any], *, year: int, month: int) -> list[tuple[int, float]]:
+        """Normalize Daikin daily consumptions (list of numbers or dicts) to (day, kWh)."""
+        today = datetime.now().astimezone().date()
+        is_current_month = (year == today.year and month == today.month)
+        parsed: list[tuple[int, float]] = []
+        for idx, item in enumerate(consumptions):
+            if isinstance(item, (int, float)):
+                day_num = idx + 1
+                if is_current_month and day_num >= today.day:
+                    continue
+                parsed.append((day_num, float(item)))
+            elif isinstance(item, dict):
+                day_num = to_int(first_value(item.get("day"), item.get("date")))
+                if day_num is None or day_num < 1 or day_num > 31:
+                    continue
+                if is_current_month and day_num >= today.day:
+                    continue
+                try:
+                    parsed.append((day_num, float(first_value(item.get("used"), item.get("value"), 0.0))))
+                except (TypeError, ValueError):
+                    continue
+        return parsed
+
+    @classmethod
+    def _normalize_power_payload(
+        cls, raw: dict[str, Any], *, home_id: str, home_name: str, year: int, month: int,
+    ) -> dict[str, Any]:
+        consumptions = raw.get("consumptions") or []
+        total = float(raw.get("total", 0.0) or 0.0)
+        price = float(raw.get("price", 0.0) or 0.0)
+        yesterday = datetime.now().astimezone().date() - timedelta(days=1)
+        daily_pairs = cls._iter_daily_consumptions(consumptions, year=year, month=month)
+        yesterday_used: float | None = None
+        if yesterday.year == year and yesterday.month == month:
+            for day_num, used in daily_pairs:
+                if day_num == yesterday.day:
+                    yesterday_used = round(used, 3)
+                    break
+        if yesterday_used is None and daily_pairs:
+            yesterday_used = round(daily_pairs[-1][1], 3)
+        return {
+            "home_id": home_id,
+            "home_name": home_name,
+            "year": year,
+            "month": month,
+            "total": round(total, 3),
+            "price": price,
+            "estimated_cost": round(total * price, 2) if price > 0 else 0.0,
+            "yesterday_used": yesterday_used,
+            "yesterday_date": yesterday.isoformat(),
+            "consumptions": consumptions,
+            "last_updated": _utc_now_iso(),
+        }
+
+    async def async_import_month_statistics(
+        self, year: int, month: int, power_data: dict[str, Any], *, statistic_id: str | None = None,
+    ) -> bool:
+        """Import daily cumulative kWh into Home Assistant long-term statistics."""
+        target_stat_id = statistic_id or self.month_statistic_id
+        if not target_stat_id:
+            return False
+        consumptions = power_data.get("consumptions") or []
+        daily_pairs = self._iter_daily_consumptions(consumptions, year=year, month=month)
+        if not daily_pairs:
+            return False
+        try:
+            from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
+            from homeassistant.components.recorder.statistics import async_import_statistics
+            from homeassistant.const import UnitOfEnergy
+        except ImportError:
+            return False
+
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        stats: list[Any] = []
+        running_sum = 0.0
+        for day_num, used in daily_pairs:
+            running_sum = round(running_sum + used, 3)
+            try:
+                start_dt = datetime(year, month, day_num, 23, 0, 0, tzinfo=local_tz)
+            except ValueError:
+                continue
+            stats.append(StatisticData(start=start_dt, state=running_sum, sum=running_sum))
+        if not stats:
+            return False
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            mean_type=StatisticMeanType.NONE,
+            name="大金空调当月累计用电",
+            source="recorder",
+            statistic_id=target_stat_id,
+            unit_class="energy",
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
+        async_import_statistics(self.hass, metadata, stats)
+        return True
+
+    async def async_fetch_power_data(
+        self, *, year: int | None = None, month: int | None = None, import_to_statistics: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch power consumption for a month and optionally import into statistics."""
+        gateway = await self._async_ensure_gateway()
+        now_local = datetime.now().astimezone()
+        target_year = year or now_local.year
+        target_month = month or now_local.month
+        raw = await self.cloud.async_get_home_power_data(
+            home_id=gateway.home_id,
+            year=target_year,
+            month=target_month,
+        )
+        normalized = self._normalize_power_payload(
+            raw, home_id=gateway.home_id, home_name=gateway.home_name, year=target_year, month=target_month,
+        )
+        if target_year == now_local.year and target_month == now_local.month:
+            self.power_data = normalized
+            self._last_power_refresh_at = datetime.now(timezone.utc)
+            self._power_refresh_date = (now_local.year, now_local.month, now_local.day)
+        imported = False
+        if import_to_statistics:
+            try:
+                imported = await self.async_import_month_statistics(target_year, target_month, normalized)
+            except Exception as exc:
+                _LOGGER.debug("Failed to import power statistics: %s", format_error(exc))
+        return {**normalized, "imported_to_statistics": imported}
+
     @staticmethod
     def _has_local_control_status(devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
-        controllable = [d for d in devices if d.device_type in AIR_CON_TYPES or d.device_type in VAM_TYPES]
+        controllable = [d for d in devices if d.device_type in (AIR_CON_TYPES | VAM_TYPES | HD_TYPES)]
         return any(bool(statuses.get(d.unique_id)) for d in controllable) if controllable else bool(statuses)
 
     async def _async_poll_local(
@@ -271,6 +444,15 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                 except (DaikinError, TimeoutError, OSError) as exc:
                     self._log_warning_limited("cloud_snapshot", "Cloud snapshot refresh failed; using local state: %s", format_error(exc))
 
+            if self._power_refresh_due():
+                try:
+                    await self.async_fetch_power_data(import_to_statistics=True)
+                    self._last_warning_at.pop("power_data", None)
+                except DaikinAuthError:
+                    raise
+                except (DaikinError, TimeoutError, OSError, ValueError) as exc:
+                    self._log_warning_limited("power_data", "Power consumption refresh failed (ignored): %s", format_error(exc))
+
             if local_error is not None and not any(s.get("last_local_refresh") or s.get("last_cloud_refresh") for s in statuses.values()):
                 raise local_error
 
@@ -291,6 +473,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                     stable_id=previous.stable_physical_id if previous is not None else None,
                 )
                 result[snapshot.unique_id] = snapshot
+            _ensure_unique_stable_ids(result)
             return result
 
     async def _async_update_data(self) -> dict[str, DaikinDevice]:
@@ -321,7 +504,16 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             status["switch"] = values["switch"]
             if device.device_type in VAM_TYPES:
                 status["switches"] = values["switch"]
-        for src, dst in (("mode", "mode"), ("air_flow", "air_flow"), ("temperature", "target_temperature")):
+        for src, dst in (
+            ("mode", "mode"),
+            ("air_flow", "air_flow"),
+            ("temperature", "target_temperature"),
+            ("fan_direction1", "fan_direction1"),
+            ("fan_direction2", "fan_direction2"),
+            ("breathe", "breathe"),
+            ("mute", "mute"),
+            ("warm_temperature", "warm_temperature"),
+        ):
             if src in values:
                 status[dst] = values[src]
         if not status:
@@ -370,10 +562,15 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             device = (self.data or {}).get(device_id)
             if device is None:
                 raise DaikinError(f"Unknown Daikin device: {device_id}")
+            payload = dict(values)
+            if "fan_direction1" in payload and "fan_direction2" not in payload:
+                payload["fan_direction2"] = to_int(device.status.get("fan_direction2")) or 0
+            elif "fan_direction2" in payload and "fan_direction1" not in payload:
+                payload["fan_direction1"] = to_int(device.status.get("fan_direction1")) or 0
             gateway = await self._async_ensure_gateway()
             try:
                 result = await self._build_transport(gateway).async_control_device(
-                    device, ack_timeout=self.control_ack_timeout, **values,
+                    device, ack_timeout=self.control_ack_timeout, **payload,
                 )
             except DaikinAuthError:
                 raise
@@ -382,7 +579,7 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
                 gateway = await self._async_rediscover_gateway()
                 try:
                     result = await self._build_transport(gateway).async_control_device(
-                        device, ack_timeout=max(self.control_ack_timeout, 5.0), **values,
+                        device, ack_timeout=max(self.control_ack_timeout, 5.0), **payload,
                     )
                 except DaikinAuthError:
                     raise

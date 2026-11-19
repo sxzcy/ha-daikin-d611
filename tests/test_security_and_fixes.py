@@ -159,7 +159,18 @@ def _build_stubs() -> dict[str, types.ModuleType]:
     class HomeAssistant:
         pass
 
+    class ServiceCall:
+        def __init__(self, data=None):
+            self.data = data or {}
+
+    class SupportsResponse:
+        NONE = "none"
+        OPTIONAL = "optional"
+        ONLY = "only"
+
     ha_core.HomeAssistant = HomeAssistant
+    ha_core.ServiceCall = ServiceCall
+    ha_core.SupportsResponse = SupportsResponse
     stubs["homeassistant.core"] = ha_core
 
     ha_exc = types.ModuleType("homeassistant.exceptions")
@@ -373,6 +384,8 @@ def _build_stubs() -> dict[str, types.ModuleType]:
         FAN_MODE = 2
         TURN_ON = 4
         TURN_OFF = 8
+        SWING_MODE = 16
+        SWING_HORIZONTAL_MODE = 32
 
     class HVACMode:
         OFF = "off"
@@ -448,9 +461,11 @@ def _build_stubs() -> dict[str, types.ModuleType]:
         HUMIDITY = "humidity"
         PM25 = "pm25"
         CO2 = "co2"
+        ENERGY = "energy"
 
     class SensorStateClass:
         MEASUREMENT = "measurement"
+        TOTAL = "total"
         TOTAL_INCREASING = "total_increasing"
 
     class SensorEntity:
@@ -502,6 +517,31 @@ def _build_stubs() -> dict[str, types.ModuleType]:
     ha_diag.async_redact_data = async_redact_data
     stubs["homeassistant.components.diagnostics"] = ha_diag
 
+    # water_heater
+    ha_wh = types.ModuleType("homeassistant.components.water_heater")
+    ha_wh.STATE_HEAT_PUMP = "heat_pump"
+    ha_wh.STATE_OFF = "off"
+
+    class WaterHeaterEntity:
+        pass
+
+    class WaterHeaterEntityFeature:
+        TARGET_TEMPERATURE = 1
+        OPERATION_MODE = 2
+
+    ha_wh.WaterHeaterEntity = WaterHeaterEntity
+    ha_wh.WaterHeaterEntityFeature = WaterHeaterEntityFeature
+    stubs["homeassistant.components.water_heater"] = ha_wh
+
+    # switch
+    ha_sw = types.ModuleType("homeassistant.components.switch")
+
+    class SwitchEntity:
+        pass
+
+    ha_sw.SwitchEntity = SwitchEntity
+    stubs["homeassistant.components.switch"] = ha_sw
+
     cc = types.ModuleType("custom_components")
     cc.__path__ = [str(CUSTOM_COMPONENTS)]
     stubs["custom_components"] = cc
@@ -551,6 +591,8 @@ class _FakeHass:
         self.config_entries.async_forward_entry_setups = AsyncMock()
         self.config_entries.async_unload_platforms = AsyncMock(return_value=True)
         self.config_entries.async_reload = AsyncMock()
+        self.services = MagicMock()
+        self.services.has_service = MagicMock(return_value=False)
 
     def async_create_task(self, coro):
         return asyncio.create_task(coro)
@@ -605,7 +647,7 @@ class DaikinV2ArchitectureTests(unittest.TestCase):
         )
 
     def _make_device(self, device_type: int = 18, room_id: int = 1, unit: int = 0, status: dict | None = None):
-        names = {18: "AIR_CON", 20: "VAM", 28: "MINI_VAM", 25: "AIR_SENSOR"}
+        names = {18: "AIR_CON", 19: "GEOTHERMIC", 20: "VAM", 22: "HD", 23: "AIR_CON_NEW", 24: "AIR_CON_BATHROOM", 25: "AIR_SENSOR", 28: "MINI_VAM"}
         return self.models.DaikinDevice(
             gateway_id="gwkey01", gateway_name="DTA117D611",
             room_id=room_id, room_name=f"Room{room_id}", room_alias=f"房间{room_id}",
@@ -624,7 +666,7 @@ class DaikinV2ArchitectureTests(unittest.TestCase):
             self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
         manifest = json.loads((INTEGRATION / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], "2.0.0")
+        self.assertEqual(manifest["version"], "2.1.0")
         self.assertFalse(self.const.DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES)
         self.assertFalse((INTEGRATION / "socket.py").exists())
         self.assertFalse((INTEGRATION / "api.py").exists())
@@ -1016,8 +1058,8 @@ class DaikinV2ArchitectureTests(unittest.TestCase):
             for mod in (self.climate_mod, self.fan_mod, self.select_mod, self.sensor_mod, self.binary_sensor_mod):
                 await mod.async_setup_entry(hass, entry, created.extend)
 
-            # 5*9 (AC) + 7 (Mini-VAM) + 14 (AirSensor) = 66 clean entities (down from 108!)
-            self.assertEqual(len(created), 66)
+            # 5*9 (AC) + 9 (Mini-VAM: +outdoor_humidity +outdoor_pm25) + 14 (AirSensor) + 2 (Gateway power) = 70 clean entities
+            self.assertEqual(len(created), 70)
             uids = {e._attr_unique_id for e in created}
             for noisy in ("_raw_status", "_last_local_refresh", "_last_cloud_refresh", "_last_control_result", "_local_gateway_binary", "_cloud_snapshot_binary"):
                 self.assertFalse(any(uid.endswith(noisy) for uid in uids), f"Noisy entity {noisy} created by default!")
@@ -1196,7 +1238,7 @@ class DaikinV2ArchitectureTests(unittest.TestCase):
         async def _run() -> None:
             # 2. _io_lock serializes concurrent refresh & control without overlap
             hass = _FakeHass()
-            entry = self.ha_ce.ConfigEntry(data={"username": "u", "password": "p"}, options={"enable_cloud_snapshot": False})
+            entry = self.ha_ce.ConfigEntry(data={"username": "u", "password": "p"}, options={"enable_cloud_snapshot": False, "enable_power_statistics": False})
             coord = self.coordinator_mod.DaikinD611Coordinator(hass, entry)
             coord.gateway = self._make_gateway()
             coord.nlc_id = "nlc"
@@ -1279,6 +1321,197 @@ class DaikinV2ArchitectureTests(unittest.TestCase):
             self.assertIn(f"{vam.unique_id}_air_flow_select", uids)
             self.assertIn(f"{sensor.unique_id}_pm25", uids)
             self.assertIn(f"{sensor.unique_id}_online_binary", uids)
+
+        asyncio.run(_run())
+
+    def test_issue_1_and_3_discovery_uniqueness_and_complementary_features(self) -> None:
+        # 1. Multi-frame room_info (>20 devices) over loopback TCP + mixed version_flag backtracking
+        def _pack_room(room_id: int, version_flag: int, alias: str, dev_type: int = 18, unit_count: int = 1) -> bytes:
+            out = bytearray(struct.pack("<HB", room_id, version_flag))
+            if version_flag != 2:
+                b_alias = alias.encode("utf-8")
+                for field in (b_alias, b_alias, b"1.png"):
+                    out.append(len(field))
+                    out.extend(field)
+            out.extend(struct.pack("<HiH", 1, dev_type, unit_count))
+            for u in range(unit_count):
+                if version_flag > 2:
+                    u_name = f"unit_{room_id}_{u}".encode("utf-8")
+                    out.append(len(u_name))
+                    out.extend(u_name)
+                    out.append(len(u_name))
+                    out.extend(u_name)
+            return bytes(out)
+
+        frame1_body = bytearray(struct.pack("<HB", 26, 20))
+        for rid in range(1, 21):
+            frame1_body.extend(_pack_room(rid, 3, f"Room{rid}"))
+        frame2_body = bytearray(struct.pack("<HB", 26, 6))
+        for rid in range(21, 27):
+            frame2_body.extend(_pack_room(rid, 3, f"Room{rid}"))
+
+        # Mixed version_flag (room 1 has vflag=1 with NO device names, room 2 has vflag=3 WITH device names)
+        mixed_body = bytearray(struct.pack("<HB", 2, 2))
+        mixed_body.extend(_pack_room(1, 1, "主卧"))
+        mixed_body.extend(_pack_room(2, 3, "客厅"))
+        mixed_devices = self.protocol.parse_room_info(bytes(mixed_body), gateway_id="gw", gateway_name="D611")
+        self.assertEqual([(d.room_id, d.alias) for d in mixed_devices], [(1, "主卧"), (2, "unit_2_0")])
+
+        # 2. Mini-VAM composite status: outdoor humidity & outdoor PM2.5
+        comp = self.protocol.parse_minivam_composite_status(bytes.fromhex("050060dbb59d00ff010202c7000502b80006023a0007028100000000"))
+        self.assertEqual(comp["outdoor_temperature"], 18.4)
+        self.assertEqual(comp["outdoor_humidity"], 58)
+        self.assertEqual(comp["outdoor_pm25"], 129)
+
+        # 3. HD status & control frame + AC swing control frame
+        hd_body = bytes([4, 0, 0, 33, 1, 1, 34, 1, 1, 35, 2]) + struct.pack("<H", 450) + bytes([0])
+        hd_parsed = self.protocol.parse_hd_status(hd_body, cmd=self.protocol.CMD_HD_STATE_UPDATE)
+        self.assertEqual(hd_parsed["switch"], 1)
+        self.assertEqual(hd_parsed["mute"], 1)
+        self.assertEqual(hd_parsed["warm_temperature"], 45.0)
+        _cmd, hd_ctrl = self.protocol.build_hd_control_frame(
+            inner_request_id=1, outer_request_id=2, room_id=4, unit=0, switch=1, mute=1, warm_temperature=46.0,
+        )
+        hd_inner = self.protocol.parse_frame(hd_ctrl)["inner"]
+        self.assertEqual(hd_inner["cmd"], self.protocol.CMD_HD_STATE_SETTING)
+        self.assertEqual(hd_inner["body"], bytes([4, 0, 1 | 2 | 16, 1, 1]) + struct.pack("<H", 460))
+
+        _cmd, swing_ctrl = self.protocol.build_control_frame(
+            inner_request_id=3, outer_request_id=4, device_type=18, room_id=1, unit=1, fan_direction1=7, fan_direction2=6,
+        )
+        swing_inner = self.protocol.parse_frame(swing_ctrl)["inner"]
+        self.assertEqual(swing_inner["body"], bytes([1, 1, 32, 7 | (6 << 4)]))
+
+        # 4. Unique ID disambiguation (same room 2 units + terminal_mac ignored) & cloud missing synthesis
+        d0 = self._make_device(18, room_id=1, unit=0, status={"cloud_key": "INDOOR:1", "cloud_physics": {"terminal_mac": "gw"}})
+        d1 = self._make_device(18, room_id=1, unit=1, status={"cloud_key": "INDOOR:1", "cloud_physics": {"terminal_mac": "gw"}})
+        d2 = self._make_device(18, room_id=2, unit=0, status={"cloud_physics": {"terminal_mac": "gw"}})
+        d3 = self._make_device(18, room_id=3, unit=0, status={"cloud_physics": {"terminal_mac": "gw"}})
+        dev_map = {d.unique_id: d for d in (d0, d1, d2, d3)}
+        self.coordinator_mod._ensure_unique_stable_ids(dev_map)
+        self.assertEqual(len({d.stable_physical_id for d in dev_map.values()}), 4)
+
+        gw = self._make_gateway()
+        synth_snap = {
+            "indoor": [
+                {"key": "INDOOR:1", "physics": {"socket_room_id": 1, "name": "客厅1"}},
+                {"key": "INDOOR:2", "physics": {"socket_room_id": 21, "name": "新增房间"}},
+            ]
+        }
+        extras = self.cloud.synthesize_missing_cloud_devices(synth_snap, [d0], gw)
+        self.assertEqual(len(extras), 1)
+        self.assertEqual(extras[0].room_id, 21)
+
+        async def _run() -> None:
+            # 5. Multi-frame room_info loopback test (26 devices returned across 2 frames!)
+            async def _multi_room_server(reader, writer):
+                try:
+                    while True:
+                        try:
+                            msg = await self.transport.async_read_frame(reader, timeout=2.0)
+                        except (self.codec.DaikinSocketError, TimeoutError):
+                            break
+                        if msg.get("cmd") == self.protocol.CMD_LOGIN:
+                            writer.write(self.protocol.build_frame(request_id=msg["request_id"], cmd_type=self.protocol.CMD_LOGIN, body=b"\x00\x01"))
+                            await writer.drain()
+                        elif msg.get("cmd") == self.protocol.CMD_TRANSFER:
+                            inner = msg["inner"]
+                            icmd = inner["cmd"]
+                            ireq = inner["request_id"]
+                            if icmd in (self.protocol.CMD_GET_ROOM_INFO, self.protocol.CMD_GET_ROOM_INFO_V1):
+                                f1 = self.protocol.build_frame(request_id=ireq, cmd_type=icmd, body=bytes(frame1_body))
+                                f2 = self.protocol.build_frame(request_id=ireq, cmd_type=icmd, body=bytes(frame2_body))
+                                writer.write(self.protocol.wrap_transfer(f1, request_id=msg["request_id"]))
+                                writer.write(self.protocol.wrap_transfer(f2, request_id=msg["request_id"]))
+                                await writer.drain()
+                finally:
+                    writer.close()
+
+            srv = await asyncio.start_server(_multi_room_server, "127.0.0.1", 0)
+            try:
+                port = srv.sockets[0].getsockname()[1]
+                t = self.transport.DaikinLocalTransport(self._make_gateway("127.0.0.1", port), nlc_id="nlc", timeout=3.0)
+                devs = await t.async_query_devices()
+                self.assertEqual(len(devs), 26)
+                self.assertEqual([d.room_id for d in devs], list(range(1, 27)))
+            finally:
+                srv.close()
+                await srv.wait_closed()
+
+            # 6. Paginated cloud list & power data fetch + climate swing + bathroom fan + water heater/switch
+            boot = _FakeSession([
+                _FakeResponse(json.dumps({"code": 0, "data": {"total": 12.5, "price": 0.6, "consumptions": [{"day": 1, "used": 4.2}]}}).encode("utf-8")),
+            ])
+            c_client = self.cloud.DaikinCloudClient("u", "p", timeout=5.0, bootstrap_session=boot)
+            c_client.token = "tok"
+            with patch.object(c_client, "_async_request_authenticated", AsyncMock(side_effect=[
+                {"list": [{"gatewayKey": "g1"}], "total": 2, "pageNum": 1, "pages": 2},
+                {"list": [{"gatewayKey": "g2"}], "total": 2, "pageNum": 2, "pages": 2},
+                {"url": "https://newlifemulti.daikin-china.com.cn/h5?encryptNlcId=enc123"},
+            ])):
+                gws = await c_client.async_list_gateways("home1")
+                self.assertEqual([g["gatewayKey"] for g in gws], ["g1", "g2"])
+                pdata = await c_client.async_get_home_power_data(home_id="home1", year=2026, month=11)
+                self.assertEqual(pdata["total"], 12.5)
+
+            hass = _FakeHass()
+            entry = self.ha_ce.ConfigEntry(entry_id="e_comp", data={"username": "u", "password": "p"})
+            coord = self.coordinator_mod.DaikinD611Coordinator(hass, entry)
+            coord.gateway = gw
+            coord.nlc_id = "nlc"
+            ac_swing = self._make_device(18, room_id=1, status={
+                "switch": 1, "mode": 0, "fan_direction1": 1, "fan_direction2": 7,
+                "cloud_capability": {"direction1": 1, "direction2": 1},
+            })
+            bath = self._make_device(24, room_id=2, status={"switch": 1, "breathe": 2})
+            hd_dev = self.models.DaikinDevice(
+                gateway_id="gwkey01", gateway_name="DTA117D611", room_id=3, room_name="R3", room_alias="地暖水机",
+                device_type=22, device_type_name="HD", unit=0, name="hd0", alias="水热交换器",
+                status={"switch": 1, "mute": 0, "warm_temperature": 42.0},
+            )
+            coord.data = {ac_swing.unique_id: ac_swing, bath.unique_id: bath, hd_dev.unique_id: hd_dev}
+            coord.power_data = coord._normalize_power_payload(
+                {"total": 12.5, "price": 0.6, "consumptions": [{"day": 18, "used": 3.5}]},
+                home_id="home1", home_name="Home", year=2026, month=11,
+            )
+            climate = self.climate_mod.DaikinD611Climate(coord, ac_swing.unique_id)
+            self.assertTrue(climate.supported_features & self.climate_mod.SWING_MODE_FEATURE)
+            self.assertTrue(climate.supported_features & self.climate_mod.SWING_HORIZONTAL_MODE_FEATURE)
+            self.assertEqual(climate.swing_mode, "⬆️")
+            self.assertEqual(climate.swing_horizontal_mode, "↔️")
+            with patch.object(coord, "async_control_device", AsyncMock()) as ctrl_mock:
+                await climate.async_set_swing_mode("↕️")
+                ctrl_mock.assert_awaited_with(ac_swing.unique_id, fan_direction1=7)
+                await climate.async_set_swing_horizontal_mode("🅰️")
+                ctrl_mock.assert_awaited_with(ac_swing.unique_id, fan_direction2=6)
+
+            bfan = self.fan_mod.DaikinD611BathroomFan(coord, bath.unique_id)
+            self.assertTrue(bfan.is_on)
+            self.assertEqual(bfan.percentage, 100)
+
+            wh_mod = importlib.import_module("custom_components.daikin_d611.water_heater")
+            sw_mod = importlib.import_module("custom_components.daikin_d611.switch")
+            wh = wh_mod.DaikinD611WaterHeater(coord, hd_dev.unique_id)
+            sw = sw_mod.DaikinD611HdMuteSwitch(coord, hd_dev.unique_id)
+            self.assertEqual(wh.current_operation, "heat_pump")
+            self.assertEqual(wh.native_target_temperature, 42.0)
+            self.assertEqual(wh._attr_native_temperature_unit, self.ha_const.UnitOfTemperature.CELSIUS)
+            self.assertFalse(hasattr(wh_mod.DaikinD611WaterHeater, "_attr_temperature_unit"))
+            self.assertFalse(sw.is_on)
+
+            p_y = self.sensor_mod.DaikinD611YesterdayPowerSensor(coord)
+            p_m = self.sensor_mod.DaikinD611MonthPowerSensor(coord)
+            self.assertEqual(p_y.native_value, 3.5)
+            self.assertEqual(p_m.native_value, 12.5)
+
+            # Also verify float-list consumptions format (real Daikin web API format)
+            float_list = [1.0] * 17 + [0.912, 0, 0]
+            coord_fl = coord._normalize_power_payload(
+                {"total": 17.912, "price": 0.6, "consumptions": float_list},
+                home_id="home1", home_name="Home", year=2026, month=11,
+            )
+            self.assertEqual(coord_fl["yesterday_used"], 0.912)
+            self.assertEqual(coord_fl["total"], 17.912)
 
         asyncio.run(_run())
 

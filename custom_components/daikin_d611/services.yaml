@@ -1,0 +1,28 @@
+get_power_data:
+  name: 获取电量统计数据
+  description: 从大金金制空气云端拉取指定年月的用电明细与电费，并可同步导入 Home Assistant 长期统计。
+  fields:
+    year:
+      name: 年份
+      description: 要查询的年份（默认当前年）。
+      example: 2026
+      selector:
+        number:
+          min: 2020
+          max: 2100
+          mode: box
+    month:
+      name: 月份
+      description: 要查询的月份 1-12（默认当前月）。
+      example: 11
+      selector:
+        number:
+          min: 1
+          max: 12
+          mode: box
+    import_to_statistics:
+      name: 导入长期统计
+      description: 是否自动将当月每日电量写入 Home Assistant 能源面板长期统计。
+      default: true
+      selector:
+        boolean:

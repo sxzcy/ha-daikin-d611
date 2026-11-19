@@ -20,6 +20,7 @@ from .const import (
     CONF_CONTROL_ACK_TIMEOUT,
     CONF_ENABLE_CLOUD_SNAPSHOT,
     CONF_ENABLE_DIAGNOSTIC_ENTITIES,
+    CONF_ENABLE_POWER_STATISTICS,
     CONF_GATEWAY,
     CONF_STATE_PRIORITY,
     CONF_TIMEOUT,
@@ -27,6 +28,7 @@ from .const import (
     DEFAULT_CONTROL_ACK_TIMEOUT,
     DEFAULT_ENABLE_CLOUD_SNAPSHOT,
     DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES,
+    DEFAULT_ENABLE_POWER_STATISTICS,
     DEFAULT_GATEWAY,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_STATE_PRIORITY,
@@ -96,6 +98,10 @@ def _options_schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
                 default=defaults.get(CONF_ENABLE_DIAGNOSTIC_ENTITIES, DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES),
             ): bool,
             vol.Required(CONF_USE_STABLE_IDS, default=defaults.get(CONF_USE_STABLE_IDS, DEFAULT_USE_STABLE_IDS)): bool,
+            vol.Required(
+                CONF_ENABLE_POWER_STATISTICS,
+                default=defaults.get(CONF_ENABLE_POWER_STATISTICS, DEFAULT_ENABLE_POWER_STATISTICS),
+            ): bool,
         }
     )
 

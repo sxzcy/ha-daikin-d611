@@ -53,3 +53,47 @@ AIR_QUALITY_STATUS: dict[int, str] = {
     4: "偏高",
     5: "严重",
 }
+
+FAN_DIRECTION_VERTICAL: dict[int, str] = {
+    1: "⬆️",
+    2: "↗️",
+    3: "➡️",
+    4: "↘️",
+    5: "⬇️",
+    6: "🅰️",
+    7: "↕️",
+}
+FAN_DIRECTION_VERTICAL_VALUES: dict[str, int] = {
+    **{label: code for code, label in FAN_DIRECTION_VERTICAL.items()},
+    "自动": 6,
+    "AUTO": 6,
+    "auto": 6,
+    "摆动": 7,
+    "上下摆动": 7,
+    "SWING": 7,
+    "swing": 7,
+    "🔄": 7,
+}
+FAN_DIRECTION_VERTICAL_OPTIONS: list[str] = list(FAN_DIRECTION_VERTICAL.values())
+
+FAN_DIRECTION_HORIZONTAL: dict[int, str] = {
+    1: "⬅️",
+    2: "↖️",
+    3: "⬆️",
+    4: "↗️",
+    5: "➡️",
+    6: "🅰️",
+    7: "↔️",
+}
+FAN_DIRECTION_HORIZONTAL_VALUES: dict[str, int] = {
+    **{label: code for code, label in FAN_DIRECTION_HORIZONTAL.items()},
+    "自动": 6,
+    "AUTO": 6,
+    "auto": 6,
+    "摆动": 7,
+    "左右摆动": 7,
+    "SWING": 7,
+    "swing": 7,
+    "🔄": 7,
+}
+FAN_DIRECTION_HORIZONTAL_OPTIONS: list[str] = list(FAN_DIRECTION_HORIZONTAL.values())

@@ -21,13 +21,20 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     AIR_CON_TYPES,
     AIR_SENSOR_TYPES,
     CONF_ENABLE_DIAGNOSTIC_ENTITIES,
+    CONF_ENABLE_POWER_STATISTICS,
     DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES,
+    DEFAULT_ENABLE_POWER_STATISTICS,
+    DEVICE_TYPE_MINI_VAM,
+    DOMAIN,
+    GEOTHERMIC_TYPES,
     VAM_TYPES,
 )
 from .coordinator import DaikinD611Coordinator
@@ -126,6 +133,36 @@ VAM_SENSORS: tuple[DaikinD611SensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda d: _status_value(d, "filter_used_percent"),
+    ),
+)
+
+MINI_VAM_EXTRA_SENSORS: tuple[DaikinD611SensorDescription, ...] = (
+    DaikinD611SensorDescription(
+        key="outdoor_humidity",
+        name="室外湿度",
+        device_class=SensorDeviceClass.HUMIDITY,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: _status_value(d, "outdoor_humidity"),
+    ),
+    DaikinD611SensorDescription(
+        key="outdoor_pm25",
+        name="室外 PM2.5",
+        device_class=SensorDeviceClass.PM25,
+        native_unit_of_measurement=UnitOfDensity.MICROGRAMS_PER_CUBIC_METER,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: _status_value(d, "outdoor_pm25"),
+    ),
+)
+
+GEOTHERMIC_SENSORS: tuple[DaikinD611SensorDescription, ...] = (
+    DaikinD611SensorDescription(
+        key="target_temperature",
+        name="设定温度",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: _status_value(d, "target_temperature", "temp"),
     ),
 )
 
@@ -246,19 +283,27 @@ async def async_setup_entry(
     """Set up Daikin D611 sensor entities."""
     coordinator = entry.runtime_data
     enable_diag = bool(entry.options.get(CONF_ENABLE_DIAGNOSTIC_ENTITIES, DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES))
-    entities: list[DaikinD611Sensor] = []
+    enable_power = bool(entry.options.get(CONF_ENABLE_POWER_STATISTICS, DEFAULT_ENABLE_POWER_STATISTICS))
+    entities: list[SensorEntity] = []
     for device_id, device in coordinator.data.items():
         if device.device_type in AIR_CON_TYPES:
-            descriptions = AIRCON_SENSORS
+            descriptions: tuple[DaikinD611SensorDescription, ...] = AIRCON_SENSORS
         elif device.device_type in VAM_TYPES:
             descriptions = VAM_SENSORS
+            if device.device_type == DEVICE_TYPE_MINI_VAM:
+                descriptions = (*descriptions, *MINI_VAM_EXTRA_SENSORS)
         elif device.device_type in AIR_SENSOR_TYPES:
             descriptions = AIR_SENSOR_SENSORS
+        elif device.device_type in GEOTHERMIC_TYPES:
+            descriptions = GEOTHERMIC_SENSORS
         else:
             continue
         if enable_diag:
             descriptions = (*descriptions, *DIAGNOSTIC_SENSORS)
         entities.extend(DaikinD611Sensor(coordinator, device_id, desc) for desc in descriptions)
+    if enable_power and coordinator.gateway is not None:
+        entities.append(DaikinD611YesterdayPowerSensor(coordinator))
+        entities.append(DaikinD611MonthPowerSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -288,3 +333,101 @@ class DaikinD611Sensor(DaikinD611Entity, SensorEntity):
         if self.entity_description.attr_fn is not None:
             attributes.update(self.entity_description.attr_fn(self.device))
         return attributes
+
+
+class _DaikinD611GatewayPowerSensor(CoordinatorEntity[DaikinD611Coordinator], SensorEntity):
+    """Base energy sensor attached to the D611 gateway device."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = getattr(SensorDeviceClass, "ENERGY", "energy")
+    _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator: DaikinD611Coordinator) -> None:
+        super().__init__(coordinator)
+        gateway = coordinator.gateway
+        gw_id = gateway.id if gateway is not None else coordinator.entry.entry_id
+        gw_name = (gateway.name if gateway is not None else None) or "Daikin D611 Gateway"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, gw_id)},
+            manufacturer="Daikin",
+            name=gw_name,
+            model="DTA117D611 Gateway",
+        )
+
+    @property
+    def available(self) -> bool:
+        return super().available and bool(self.coordinator.power_data)
+
+
+class DaikinD611YesterdayPowerSensor(_DaikinD611GatewayPowerSensor):
+    """Daikin cloud yesterday power consumption sensor (kWh)."""
+
+    _attr_state_class = getattr(SensorStateClass, "TOTAL", "total")
+
+    def __init__(self, coordinator: DaikinD611Coordinator) -> None:
+        super().__init__(coordinator)
+        gw_id = coordinator.gateway.id if coordinator.gateway is not None else coordinator.entry.entry_id
+        self._attr_name = "昨日用电"
+        self._attr_unique_id = f"{gw_id}_power_yesterday"
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.power_data.get("yesterday_used")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.power_data
+        if not data:
+            return {}
+        return {
+            "yesterday_date": data.get("yesterday_date"),
+            "month_total": data.get("total"),
+            "price": data.get("price"),
+            "estimated_cost": data.get("estimated_cost"),
+            "last_updated": data.get("last_updated"),
+        }
+
+
+class DaikinD611MonthPowerSensor(_DaikinD611GatewayPowerSensor):
+    """Daikin cloud current month cumulative power consumption sensor (kWh)."""
+
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, coordinator: DaikinD611Coordinator) -> None:
+        super().__init__(coordinator)
+        gw_id = coordinator.gateway.id if coordinator.gateway is not None else coordinator.entry.entry_id
+        self._attr_name = "当月累计用电"
+        self._attr_unique_id = f"{gw_id}_power_month"
+
+    async def async_added_to_hass(self) -> None:
+        if hasattr(super(), "async_added_to_hass"):
+            await super().async_added_to_hass()
+        self.coordinator.month_statistic_id = self.entity_id
+        if self.coordinator.power_data:
+            try:
+                await self.coordinator.async_import_month_statistics(
+                    int(self.coordinator.power_data.get("year")),
+                    int(self.coordinator.power_data.get("month")),
+                    self.coordinator.power_data,
+                    statistic_id=self.entity_id,
+                )
+            except Exception:
+                pass
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.power_data.get("total")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.power_data
+        if not data:
+            return {}
+        return {
+            "year": data.get("year"),
+            "month": data.get("month"),
+            "price": data.get("price"),
+            "estimated_cost": data.get("estimated_cost"),
+            "daily_consumptions": data.get("consumptions", []),
+            "last_updated": data.get("last_updated"),
+        }

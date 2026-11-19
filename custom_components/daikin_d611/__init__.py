@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import voluptuous as vol
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
 from .const import (
@@ -11,6 +14,7 @@ from .const import (
     DEFAULT_USE_STABLE_IDS,
     DOMAIN,
     PLATFORMS,
+    SERVICE_GET_POWER_DATA,
     UNIQUE_ID_SUFFIXES,
 )
 from .coordinator import DaikinD611Coordinator
@@ -54,7 +58,49 @@ async def async_setup_entry(hass: HomeAssistant, entry: DaikinD611ConfigEntry) -
         _migrate_stable_ids(hass, entry, coordinator)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_register_services(hass)
     return True
+
+
+def _async_register_services(hass: HomeAssistant) -> None:
+    services = getattr(hass, "services", None)
+    if services is None or services.has_service(DOMAIN, SERVICE_GET_POWER_DATA):
+        return
+
+    schema = vol.Schema(
+        {
+            vol.Optional("year"): int,
+            vol.Optional("month"): int,
+            vol.Optional("import_to_statistics", default=True): bool,
+        }
+    )
+
+    async def _handle_get_power_data(call: ServiceCall) -> dict:
+        coordinators = [
+            entry.runtime_data
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if getattr(entry, "runtime_data", None) is not None
+        ]
+        if not coordinators:
+            raise HomeAssistantError("No active Daikin D611 coordinator available")
+        year = call.data.get("year")
+        month = call.data.get("month")
+        if month is not None and not 1 <= int(month) <= 12:
+            raise HomeAssistantError(f"Invalid month: {month}")
+        import_to_stats = bool(call.data.get("import_to_statistics", True))
+        return await coordinators[0].async_fetch_power_data(
+            year=int(year) if year is not None else None,
+            month=int(month) if month is not None else None,
+            import_to_statistics=import_to_stats,
+        )
+
+    services.async_register(
+        DOMAIN,
+        SERVICE_GET_POWER_DATA,
+        _handle_get_power_data,
+        schema=schema,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 def _migrate_stable_ids(

@@ -13,6 +13,7 @@ from .const import (
     DEVICE_TYPE_AIR_CON_NEW,
     DEVICE_TYPE_AIR_SENSOR,
     DEVICE_TYPE_GEOTHERMIC,
+    DEVICE_TYPE_HD,
     DEVICE_TYPE_MINI_VAM,
     DEVICE_TYPE_VAM,
 )
@@ -31,6 +32,9 @@ CMD_AIRCON_STATUS_QUERY_V1 = 259
 CMD_AIRCON_STATUS_CONTROL = 1
 CMD_VAM_STATUS_QUERY = 3
 CMD_VAM_STATUS_CONTROL = 1
+CMD_HD_STATUS_QUERY = 3
+CMD_HD_STATE_UPDATE = 13
+CMD_HD_STATE_SETTING = 14
 CMD_MINIVAM_COMPOSITE_QUERY = 52
 CMD_AIR_SENSOR_INFO_2 = 89
 CMD_AIR_SENSOR_STATUS_2 = 91
@@ -40,6 +44,7 @@ DEVICE_NAMES: dict[int, str] = {
     DEVICE_TYPE_AIR_CON_NEW: "AIR_CON_NEW",
     DEVICE_TYPE_AIR_CON_BATHROOM: "AIR_CON_BATHROOM",
     DEVICE_TYPE_GEOTHERMIC: "GEOTHERMIC",
+    DEVICE_TYPE_HD: "HD",
     DEVICE_TYPE_VAM: "VAM",
     DEVICE_TYPE_MINI_VAM: "MINI_VAM",
     DEVICE_TYPE_AIR_SENSOR: "AIR_SENSOR",
@@ -111,19 +116,34 @@ def build_room_info_frame(*, inner_request_id: int, outer_request_id: int, termi
 
 
 def build_status_query_frame(
-    *, inner_request_id: int, outer_request_id: int, device_type: int, room_id: int, terminal_type: int | None,
+    *,
+    inner_request_id: int,
+    outer_request_id: int,
+    device_type: int,
+    room_id: int,
+    terminal_type: int | None,
+    unit: int = 0,
 ) -> tuple[int, bytes]:
-    is_aircon = device_type in AIR_CON_TYPES
+    if device_type == DEVICE_TYPE_HD:
+        inner = build_frame(
+            request_id=inner_request_id,
+            cmd_type=CMD_HD_STATUS_QUERY,
+            body=bytes((room_id & 0xFF, unit & 0xFF, 0x01)),
+            target=8,
+            device_type=device_type,
+        )
+        return CMD_HD_STATUS_QUERY, wrap_transfer(inner, request_id=outer_request_id)
+    is_aircon = device_type in AIR_CON_TYPES or device_type == DEVICE_TYPE_GEOTHERMIC
     cmd = (CMD_AIRCON_STATUS_QUERY_V1 if terminal_type in (1, 3) else CMD_AIRCON_STATUS_QUERY) if is_aircon else CMD_VAM_STATUS_QUERY
-    body = bytes((room_id & 0xFF, 0x00, 0xFF if is_aircon else 0x07))
+    body = bytes((room_id & 0xFF, unit & 0xFF, 0xFF if is_aircon else 0x07))
     inner = build_frame(request_id=inner_request_id, cmd_type=cmd, body=body, target=8, device_type=device_type)
     return cmd, wrap_transfer(inner, request_id=outer_request_id)
 
 
-def build_minivam_composite_query_frame(*, inner_request_id: int, outer_request_id: int, room_id: int) -> tuple[int, bytes]:
+def build_minivam_composite_query_frame(*, inner_request_id: int, outer_request_id: int, room_id: int, unit: int = 0) -> tuple[int, bytes]:
     inner = build_frame(
         request_id=inner_request_id, cmd_type=CMD_MINIVAM_COMPOSITE_QUERY,
-        body=bytes((room_id & 0xFF, 0x00)), target=8, device_type=DEVICE_TYPE_MINI_VAM,
+        body=bytes((room_id & 0xFF, unit & 0xFF)), target=8, device_type=DEVICE_TYPE_MINI_VAM,
     )
     return CMD_MINIVAM_COMPOSITE_QUERY, wrap_transfer(inner, request_id=outer_request_id)
 
@@ -141,14 +161,18 @@ def build_control_frame(
     outer_request_id: int,
     device_type: int,
     room_id: int,
+    unit: int = 0,
     switch: int | None = None,
     mode: int | None = None,
     air_flow: int | None = None,
     temperature: float | None = None,
+    fan_direction1: int | None = None,
+    fan_direction2: int | None = None,
+    breathe: int | None = None,
 ) -> tuple[int, bytes]:
     is_aircon = device_type in AIR_CON_TYPES
     cmd = CMD_AIRCON_STATUS_CONTROL if is_aircon else CMD_VAM_STATUS_CONTROL
-    body = bytearray((room_id & 0xFF, 0x00, 0x00))
+    body = bytearray((room_id & 0xFF, unit & 0xFF, 0x00))
     flag = 0
     if switch is not None:
         body.append(switch & 0xFF)
@@ -162,9 +186,50 @@ def build_control_frame(
     if temperature is not None and is_aircon:
         body.extend(struct.pack("<H", int(round(temperature * 10))))
         flag |= 16
+    if is_aircon and (fan_direction1 is not None or fan_direction2 is not None):
+        d1 = (fan_direction1 or 0) & 0x0F
+        d2 = (fan_direction2 or 0) & 0x0F
+        body.append(d1 | (d2 << 4))
+        flag |= 32
+    if device_type == DEVICE_TYPE_AIR_CON_BATHROOM and breathe is not None:
+        body.append(breathe & 0xFF)
+        flag |= 128
     body[2] = flag
     inner = build_frame(request_id=inner_request_id, cmd_type=cmd, body=bytes(body), target=8, device_type=device_type)
     return cmd, wrap_transfer(inner, request_id=outer_request_id)
+
+
+def build_hd_control_frame(
+    *,
+    inner_request_id: int,
+    outer_request_id: int,
+    room_id: int,
+    unit: int = 0,
+    switch: int | None = None,
+    mute: int | None = None,
+    warm_temperature: float | None = None,
+) -> tuple[int, bytes]:
+    """Build HD (Heat Exchanger) control frame (cmd 14)."""
+    body = bytearray((room_id & 0xFF, unit & 0xFF, 0x00))
+    flag = 0
+    if switch is not None:
+        body.append(switch & 0xFF)
+        flag |= 1
+    if mute is not None:
+        body.append(mute & 0xFF)
+        flag |= 2
+    if warm_temperature is not None:
+        body.extend(struct.pack("<H", int(round(warm_temperature * 10))))
+        flag |= 16
+    body[2] = flag
+    inner = build_frame(
+        request_id=inner_request_id,
+        cmd_type=CMD_HD_STATE_SETTING,
+        body=bytes(body),
+        target=8,
+        device_type=DEVICE_TYPE_HD,
+    )
+    return CMD_HD_STATE_SETTING, wrap_transfer(inner, request_id=outer_request_id)
 
 
 def parse_frame(frame: bytes, *, _depth: int = 0) -> dict[str, Any]:
@@ -215,6 +280,58 @@ def _read_u8_text(data: bytes, pos: int) -> tuple[str, bytes, int]:
     return decode_gateway_text(raw), raw, pos + 1 + size
 
 
+def _parse_single_room(
+    body: bytes,
+    pos: int,
+    *,
+    gateway_id: str,
+    gateway_name: str,
+    read_device_names: bool | None,
+) -> tuple[list[DaikinDevice], int]:
+    room_id, version_flag = struct.unpack_from("<HB", body, pos)
+    pos += 3
+    if version_flag != 2:
+        room_name, room_name_raw, pos = _read_u8_text(body, pos)
+        room_alias, room_alias_raw, pos = _read_u8_text(body, pos)
+        icon, icon_raw, pos = _read_u8_text(body, pos)
+    else:
+        room_name = room_alias = icon = ""
+        room_name_raw = room_alias_raw = icon_raw = b""
+    group_count = struct.unpack_from("<H", body, pos)[0]
+    pos += 2
+    if group_count > 64:
+        raise DaikinSocketError(f"Implausible group_count: {group_count}")
+    devices: list[DaikinDevice] = []
+    should_read_names = (version_flag > 2) if read_device_names is None else read_device_names
+    for _ in range(group_count):
+        device_type, device_count = struct.unpack_from("<iH", body, pos)
+        pos += 6
+        if device_count > 64:
+            raise DaikinSocketError(f"Implausible device_count: {device_count}")
+        for unit in range(device_count):
+            if should_read_names or version_flag > 2:
+                device_name, device_name_raw, pos = _read_u8_text(body, pos)
+                device_alias, device_alias_raw, pos = _read_u8_text(body, pos)
+            else:
+                device_name, device_alias = "", room_alias
+                device_name_raw = device_alias_raw = b""
+            devices.append(
+                DaikinDevice(
+                    gateway_id=gateway_id, gateway_name=gateway_name,
+                    room_id=room_id, room_name=room_name, room_alias=room_alias,
+                    device_type=device_type, device_type_name=DEVICE_NAMES.get(device_type, str(device_type)),
+                    unit=unit, name=device_name, alias=device_alias,
+                    raw={
+                        "room_version_flag": version_flag, "icon": icon,
+                        "room_name_raw": room_name_raw.hex(), "room_alias_raw": room_alias_raw.hex(),
+                        "icon_raw": icon_raw.hex(), "device_name_raw": device_name_raw.hex(),
+                        "device_alias_raw": device_alias_raw.hex(),
+                    },
+                )
+            )
+    return devices, pos
+
+
 def _parse_room_info_body(
     body: bytes, *, gateway_id: str, gateway_name: str, always_read_device_names: bool,
 ) -> tuple[list[DaikinDevice], int]:
@@ -223,46 +340,42 @@ def _parse_room_info_body(
     pos = 3
     devices: list[DaikinDevice] = []
     for _ in range(body[2]):
-        room_id, version_flag = struct.unpack_from("<HB", body, pos)
-        pos += 3
-        if version_flag != 2:
-            room_name, room_name_raw, pos = _read_u8_text(body, pos)
-            room_alias, room_alias_raw, pos = _read_u8_text(body, pos)
-            icon, icon_raw, pos = _read_u8_text(body, pos)
-        else:
-            room_name = room_alias = icon = ""
-            room_name_raw = room_alias_raw = icon_raw = b""
-        group_count = struct.unpack_from("<H", body, pos)[0]
-        pos += 2
-        for _ in range(group_count):
-            device_type, device_count = struct.unpack_from("<iH", body, pos)
-            pos += 6
-            for unit in range(device_count):
-                if always_read_device_names or version_flag > 2:
-                    device_name, device_name_raw, pos = _read_u8_text(body, pos)
-                    device_alias, device_alias_raw, pos = _read_u8_text(body, pos)
-                else:
-                    device_name, device_alias = "", room_alias
-                    device_name_raw = device_alias_raw = b""
-                devices.append(
-                    DaikinDevice(
-                        gateway_id=gateway_id, gateway_name=gateway_name,
-                        room_id=room_id, room_name=room_name, room_alias=room_alias,
-                        device_type=device_type, device_type_name=DEVICE_NAMES.get(device_type, str(device_type)),
-                        unit=unit, name=device_name, alias=device_alias,
-                        raw={
-                            "room_version_flag": version_flag, "icon": icon,
-                            "room_name_raw": room_name_raw.hex(), "room_alias_raw": room_alias_raw.hex(),
-                            "icon_raw": icon_raw.hex(), "device_name_raw": device_name_raw.hex(),
-                            "device_alias_raw": device_alias_raw.hex(),
-                        },
-                    )
-                )
+        room_devices, pos = _parse_single_room(
+            body, pos, gateway_id=gateway_id, gateway_name=gateway_name,
+            read_device_names=True if always_read_device_names else None,
+        )
+        devices.extend(room_devices)
     return devices, pos
 
 
-def parse_room_info(body: bytes, *, gateway_id: str, gateway_name: str) -> list[DaikinDevice]:
-    """Parse room & device inventory from a room-info response body."""
+def _parse_room_info_backtrack(
+    body: bytes, pos: int, remaining_rooms: int, *, gateway_id: str, gateway_name: str,
+) -> list[DaikinDevice] | None:
+    if remaining_rooms == 0:
+        return [] if pos == len(body) else None
+    for read_names in (False, True):
+        try:
+            room_devices, next_pos = _parse_single_room(
+                body, pos, gateway_id=gateway_id, gateway_name=gateway_name, read_device_names=read_names,
+            )
+        except (IndexError, struct.error, DaikinSocketError):
+            continue
+        rest = _parse_room_info_backtrack(
+            body, next_pos, remaining_rooms - 1, gateway_id=gateway_id, gateway_name=gateway_name,
+        )
+        if rest is not None:
+            return room_devices + rest
+    return None
+
+
+def parse_room_info_packet(
+    body: bytes, *, gateway_id: str, gateway_name: str,
+) -> tuple[int, int, list[DaikinDevice]]:
+    """Parse one room-info packet and return (total_rooms, frame_room_count, devices)."""
+    if len(body) < 3:
+        raise DaikinSocketError(f"Room info body too short: {body.hex()}")
+    total_rooms = struct.unpack_from("<H", body, 0)[0]
+    frame_room_count = body[2]
     errors: list[Exception] = []
     for always_read in (False, True):
         try:
@@ -273,9 +386,23 @@ def parse_room_info(body: bytes, *, gateway_id: str, gateway_name: str) -> list[
             errors.append(exc)
             continue
         if pos == len(body):
-            return devices
+            return total_rooms, frame_room_count, devices
         errors.append(DaikinSocketError(f"Room info parser stopped at {pos}/{len(body)}"))
+    if frame_room_count <= 64 and (
+        backtracked := _parse_room_info_backtrack(
+            body, 3, frame_room_count, gateway_id=gateway_id, gateway_name=gateway_name,
+        )
+    ) is not None:
+        return total_rooms, frame_room_count, backtracked
     raise DaikinSocketError(f"Could not parse room info: {errors[-1] if errors else body.hex()}")
+
+
+def parse_room_info(body: bytes, *, gateway_id: str, gateway_name: str) -> list[DaikinDevice]:
+    """Parse room & device inventory from a room-info response body."""
+    _total_rooms, _frame_rooms, devices = parse_room_info_packet(
+        body, gateway_id=gateway_id, gateway_name=gateway_name,
+    )
+    return devices
 
 
 def parse_aircon_status(body: bytes) -> dict[str, Any]:
@@ -383,7 +510,11 @@ def parse_minivam_composite_status(body: bytes) -> dict[str, Any]:
         if isinstance(value, int) and tag in (2, 3, 5):
             status[f"composite_tag_{tag}_scaled"] = value / 10
         if isinstance(value, int) and tag == 5:
-            status["local_temperature"] = status["composite_temperature"] = value / 10
+            status["local_temperature"] = status["composite_temperature"] = status["outdoor_temperature"] = value / 10
+        elif isinstance(value, int) and tag == 6:
+            status["outdoor_humidity"] = value
+        elif isinstance(value, int) and tag == 7:
+            status["outdoor_pm25"] = value
     if error is not None:
         status["composite_parse_error"] = "missing_tag_size" if error[1] == "missing_size" else "truncated_tag"
     if pos < len(body):
@@ -396,7 +527,7 @@ def parse_minivam_composite_status(body: bytes) -> dict[str, Any]:
 
 
 def _normalize_device_key(value: Any) -> str:
-    return str(value or "").replace(":", "").replace("-", "").casefold()
+    return str(value or "").strip().replace(":", "").replace("-", "").casefold().removeprefix("0x")
 
 
 def _read_i16(data: bytes, pos: int) -> tuple[int, int]:
@@ -538,3 +669,48 @@ def match_air_sensor_records(device: DaikinDevice, records: list[dict[str, Any]]
     if room_matches := [r for r in records if to_int(r.get("room_id")) == device.room_id]:
         return room_matches
     return records if len(records) == 1 else []
+
+
+def parse_hd_status(body: bytes, *, cmd: int = CMD_HD_STATUS_QUERY) -> dict[str, Any]:
+    """Parse HD (Heat Exchanger) status from cmd 3 or cmd 13."""
+    if len(body) < 3:
+        raise DaikinSocketError(f"HD status body too short: {body.hex()}")
+    status: dict[str, Any] = {"room_id": body[0], "unit": body[1], "raw": body.hex()}
+    if cmd == CMD_HD_STATE_UPDATE:
+        if len(body) < 4:
+            return status
+        pos = 3
+        while pos < len(body):
+            flag_byte = body[pos]
+            pos += 1
+            if flag_byte == 0 or pos >= len(body):
+                break
+            field_len = body[pos]
+            pos += 1
+            field = body[pos : pos + field_len]
+            if len(field) != field_len:
+                break
+            pos += field_len
+            if flag_byte == 1 and field_len == 1:
+                status["mute_enable"] = field[0]
+            elif flag_byte == 2 and field_len == 9:
+                status["temperature_set"] = field[0]
+                status["cold_upper"] = struct.unpack_from("<H", field, 1)[0] / 10.0
+                status["cold_lower"] = struct.unpack_from("<H", field, 3)[0] / 10.0
+                status["warm_upper"] = struct.unpack_from("<H", field, 5)[0] / 10.0
+                status["warm_lower"] = struct.unpack_from("<H", field, 7)[0] / 10.0
+            elif flag_byte == 33 and field_len == 1:
+                status["switch"] = field[0]
+            elif flag_byte == 34 and field_len == 1:
+                status["mute"] = field[0]
+            elif flag_byte == 35 and field_len == 2:
+                status["warm_temperature"] = struct.unpack_from("<H", field, 0)[0] / 10.0
+            elif flag_byte == 36 and field_len == 2:
+                status["cold_temperature"] = struct.unpack_from("<H", field, 0)[0] / 10.0
+        return status
+
+    flag = body[2]
+    status["raw_flag"] = flag
+    if flag & 1 and len(body) >= 4:
+        status["switch"] = body[3]
+    return status

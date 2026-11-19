@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import re
 from typing import Any
 
-from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, VAM_TYPES
+from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, DEVICE_TYPE_GEOTHERMIC, DEVICE_TYPE_HD, VAM_TYPES
 
 HEX_ALIAS_RE = re.compile(r"^(?:0x)?[0-9a-f]{6,16}$", re.IGNORECASE)
 MACHINE_PAIR_RE = re.compile(r"\d+-\d+")
@@ -99,6 +99,10 @@ class DaikinDevice:
             label = f"房间 {self.room_id}"
         if self.device_type in AIR_CON_TYPES:
             return _append_suffix_once(label, "空调")
+        if self.device_type == DEVICE_TYPE_HD:
+            return _append_suffix_once(label, "水热交换器")
+        if self.device_type == DEVICE_TYPE_GEOTHERMIC:
+            return _append_suffix_once(label, "地暖")
         if self.device_type in VAM_TYPES:
             return label
         return label
@@ -120,7 +124,6 @@ class DaikinDevice:
             physics.get("serial_no"),
             physics.get("device_no"),
             physics.get("mac"),
-            physics.get("terminal_mac"),
         )
         gateway = _stable_identifier(self.gateway_id)
         device_type = _stable_identifier(self.device_type_name or self.device_type)
