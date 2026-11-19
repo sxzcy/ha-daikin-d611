@@ -19,14 +19,14 @@ DEFAULT_SCAN_INTERVAL = 60
 DEFAULT_TIMEOUT = 20
 DEFAULT_CONTROL_ACK_TIMEOUT = 3
 DEFAULT_ENABLE_CLOUD_SNAPSHOT = True
-DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES = True
+DEFAULT_ENABLE_DIAGNOSTIC_ENTITIES = False
 DEFAULT_STATE_PRIORITY = "local_first"
 DEFAULT_USE_STABLE_IDS = True
 
 STATE_PRIORITY_CLOUD_FIRST = "cloud_first"
 STATE_PRIORITY_LOCAL_FIRST = "local_first"
 
-UNIQUE_ID_SUFFIXES = {
+UNIQUE_ID_SUFFIXES: dict[str, tuple[str, ...]] = {
     "binary_sensor": (
         "_online_binary",
         "_power_binary",
@@ -61,34 +61,22 @@ UNIQUE_ID_SUFFIXES = {
     ),
 }
 
-DIAGNOSTIC_UNIQUE_ID_SUFFIXES = {
-    "binary_sensor": ("_local_gateway_binary", "_cloud_snapshot_binary"),
-    "sensor": ("_last_local_refresh", "_last_cloud_refresh", "_last_control_result"),
-}
-
 PLATFORMS = ["climate", "fan", "sensor", "binary_sensor", "select"]
 
 DEFAULT_UPDATE_INTERVAL = timedelta(seconds=DEFAULT_SCAN_INTERVAL)
 
 DEVICE_TYPE_AIR_CON = 18
-DEVICE_TYPE_AIR_CON_NEW = 23
-DEVICE_TYPE_AIR_CON_BATHROOM = 24
 DEVICE_TYPE_GEOTHERMIC = 19
 DEVICE_TYPE_VAM = 20
-DEVICE_TYPE_MINI_VAM = 28
+DEVICE_TYPE_AIR_CON_NEW = 23
+DEVICE_TYPE_AIR_CON_BATHROOM = 24
 DEVICE_TYPE_AIR_SENSOR = 25
+DEVICE_TYPE_MINI_VAM = 28
 
-AIR_CON_TYPES = {
+AIR_CON_TYPES = frozenset({
     DEVICE_TYPE_AIR_CON,
     DEVICE_TYPE_AIR_CON_NEW,
     DEVICE_TYPE_AIR_CON_BATHROOM,
-}
-
-VAM_TYPES = {
-    DEVICE_TYPE_VAM,
-    DEVICE_TYPE_MINI_VAM,
-}
-
-AIR_SENSOR_TYPES = {
-    DEVICE_TYPE_AIR_SENSOR,
-}
+})
+VAM_TYPES = frozenset({DEVICE_TYPE_VAM, DEVICE_TYPE_MINI_VAM})
+AIR_SENSOR_TYPES = frozenset({DEVICE_TYPE_AIR_SENSOR})

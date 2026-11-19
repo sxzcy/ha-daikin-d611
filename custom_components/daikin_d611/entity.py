@@ -1,17 +1,21 @@
-"""Base entities for Daikin DTA117D611."""
+"""Base entity for Daikin DTA117D611."""
 
 from __future__ import annotations
 
-from homeassistant.helpers.entity import DeviceInfo
+from typing import Any
+
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .codec import DaikinAuthError, DaikinError, format_error
 from .const import CONF_USE_STABLE_IDS, DEFAULT_USE_STABLE_IDS, DOMAIN
 from .coordinator import DaikinD611Coordinator
 from .models import DaikinDevice
 
 
 class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
-    """Base Daikin DTA117D611 entity."""
+    """Base Daikin DTA117D611 coordinator entity."""
 
     _attr_has_entity_name = True
 
@@ -21,13 +25,15 @@ class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
         device = self.device
         self._attr_unique_id = self.entity_unique_id
         device_identifier = device.stable_physical_id if self._use_stable_ids else device.unique_id
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, device_identifier)},
-            name=device.stable_name,
-            manufacturer="Daikin",
-            model=f"DTA117D611 {device.device_type_name}",
-            via_device=(DOMAIN, device.gateway_id),
-        )
+        device_info_kwargs: dict[str, Any] = {
+            "identifiers": {(DOMAIN, device_identifier)},
+            "name": device.stable_name,
+            "manufacturer": "Daikin",
+            "model": f"DTA117D611 {device.device_type_name}",
+        }
+        if coordinator.gateway_device_id:
+            device_info_kwargs["via_device_id"] = coordinator.gateway_device_id
+        self._attr_device_info = DeviceInfo(**device_info_kwargs)
 
     @property
     def device(self) -> DaikinDevice:
@@ -35,9 +41,7 @@ class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
 
     @property
     def entity_unique_id(self) -> str:
-        if self._use_stable_ids:
-            return self.device.stable_physical_id
-        return self.device.unique_id
+        return self.device.stable_physical_id if self._use_stable_ids else self.device.unique_id
 
     @property
     def _use_stable_ids(self) -> bool:
@@ -48,43 +52,26 @@ class DaikinD611Entity(CoordinatorEntity[DaikinD611Coordinator]):
         return super().available and self.device_id in self.coordinator.data and self.device.available
 
     @property
-    def extra_state_attributes(self):
+    def extra_state_attributes(self) -> dict[str, Any]:
         device = self.device
-        attributes = {
-            "gateway": device.gateway_name,
+        attributes: dict[str, Any] = {
             "room_id": device.room_id,
-            "room_name": device.room_name,
-            "room_alias": device.room_alias,
-            "device_type": device.device_type,
-            "device_type_name": device.device_type_name,
+            "device_type": device.device_type_name,
             "unit": device.unit,
         }
-        for key in (
-            "local_temperature",
-            "composite_temperature",
-            "local_sensor_temperature",
-            "local_humidity",
-            "local_pm25",
-            "local_co2",
-            "local_tvoc",
-            "local_voc",
-            "local_hcho",
-            "local_tvoc_status",
-            "local_source",
-            "local_gateway",
-            "last_local_refresh",
-            "cloud_source",
-            "last_cloud_refresh",
-            "state_sources",
-            "last_control_time",
-            "last_control_result",
-            "last_control_values",
-            "last_control_ack_cmd",
-            "last_control_ack_request_id",
-            "local_gateway_available",
-            "cloud_snapshot_available",
-            "state_stale",
-        ):
-            if key in device.status:
-                attributes[key] = device.status[key]
+        if device.room_alias or device.room_name:
+            attributes["room"] = device.room_alias or device.room_name
+        if "state_stale" in device.status:
+            attributes["state_stale"] = bool(device.status["state_stale"])
         return attributes
+
+    async def _async_control_device(self, **values: Any) -> None:
+        try:
+            await self.coordinator.async_control_device(self.device_id, **values)
+        except DaikinAuthError as exc:
+            entry = self.coordinator.entry
+            if hasattr(entry, "async_start_reauth"):
+                entry.async_start_reauth(self.coordinator.hass)
+            raise HomeAssistantError(f"Authentication failed: {format_error(exc)}") from exc
+        except (DaikinError, TimeoutError, OSError) as exc:
+            raise HomeAssistantError(f"Failed to control Daikin device: {format_error(exc)}") from exc

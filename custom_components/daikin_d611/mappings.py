@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-AIRCON_MODES = {
+AIRCON_MODES: dict[int, str] = {
     0: "制冷",
     1: "除湿",
     2: "送风",
@@ -14,7 +14,7 @@ AIRCON_MODES = {
     8: "制热",
     9: "除湿",
 }
-AIRCON_MODE_VALUES = {
+AIRCON_MODE_VALUES: dict[str, int] = {
     "制冷": 0,
     "除湿": 1,
     "送风": 2,
@@ -22,7 +22,7 @@ AIRCON_MODE_VALUES = {
     "制热": 4,
 }
 
-AIRCON_FAN = {
+AIRCON_FAN: dict[int, str] = {
     0: "最弱",
     1: "弱",
     2: "中",
@@ -30,33 +30,22 @@ AIRCON_FAN = {
     4: "最强",
     5: "自动",
 }
-AIRCON_FAN_VALUES = {value: key for key, value in AIRCON_FAN.items()}
+AIRCON_FAN_VALUES: dict[str, int] = {label: code for code, label in AIRCON_FAN.items()}
 
-VAM_MODES = {
+VAM_MODES: dict[int, str] = {
     0: "内循环",
     1: "热交换",
     2: "自动",
     3: "防污染",
     4: "排异味",
 }
-VAM_MODE_VALUES = {value: key for key, value in VAM_MODES.items()}
+VAM_MODE_VALUES: dict[str, int] = {label: code for code, label in VAM_MODES.items()}
 
-VAM_AIR_FLOW = {
-    1: "弱",
-    2: "中",
-    3: "强",
-    4: "急速",
-}
-VAM_AIR_FLOW_VALUES = {value: key for key, value in VAM_AIR_FLOW.items()}
+VAM_AIR_FLOW: dict[int, str] = {1: "弱", 2: "中", 3: "强", 4: "急速"}
+VAM_AIR_FLOW_VALUES: dict[str, int] = {label: code for code, label in VAM_AIR_FLOW.items()}
 
-OUTDOOR_STATUS = {
-    0: "未知",
-    1: "停机",
-    2: "待机",
-    3: "运行",
-}
-
-AIR_QUALITY_STATUS = {
+OUTDOOR_STATUS: dict[int, str] = {0: "未知", 1: "停机", 2: "待机", 3: "运行"}
+AIR_QUALITY_STATUS: dict[int, str] = {
     0: "优",
     1: "良",
     2: "轻度",
@@ -64,4 +53,3 @@ AIR_QUALITY_STATUS = {
     4: "偏高",
     5: "严重",
 }
-

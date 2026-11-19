@@ -13,6 +13,14 @@
           "scan_interval": "Scan interval",
           "timeout": "Timeout"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Daikin D611 Bridge",
+        "description": "Update your Daikin New Life Multi credentials to restore gateway access.",
+        "data": {
+          "username": "Account",
+          "password": "Password"
+        }
       }
     },
     "error": {
@@ -23,7 +31,8 @@
       "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "Gateway is already configured"
+      "already_configured": "Gateway is already configured",
+      "reauth_successful": "Re-authentication was successful"
     }
   },
   "options": {

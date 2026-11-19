@@ -1,10 +1,10 @@
-"""Shared helpers and codecs for Daikin DTA117D611."""
+"""Shared exceptions and codec helpers for Daikin DTA117D611."""
 
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any
+import uuid
 
 
 class DaikinError(RuntimeError):
@@ -20,7 +20,12 @@ class DaikinApiError(DaikinError):
 
 
 class DaikinSocketError(DaikinError):
-    """Socket gateway error."""
+    """Local gateway socket error."""
+
+
+def format_error(exc: BaseException) -> str:
+    """Return a non-empty human-readable description for an exception."""
+    return str(exc) or exc.__class__.__name__
 
 
 def make_push_id() -> str:
@@ -46,9 +51,7 @@ def to_int(value: Any) -> int | None:
 def to_list(value: Any) -> list[Any]:
     if value is None:
         return []
-    if isinstance(value, list):
-        return value
-    return [value]
+    return value if isinstance(value, list) else [value]
 
 
 def compact_json(value: Any) -> str:

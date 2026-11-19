@@ -1,7 +1,8 @@
-"""Models for Daikin DTA117D611."""
+"""Domain models for Daikin DTA117D611."""
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import re
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, VAM_TYPES
 
 HEX_ALIAS_RE = re.compile(r"^(?:0x)?[0-9a-f]{6,16}$", re.IGNORECASE)
+MACHINE_PAIR_RE = re.compile(r"\d+-\d+")
 STABLE_ID_RE = re.compile(r"[^0-9A-Za-z]+")
 
 
@@ -18,11 +20,7 @@ def _clean_text(value: str | None) -> str:
 
 def _is_machine_label(value: str | None) -> bool:
     text = _clean_text(value)
-    if not text:
-        return True
-    if HEX_ALIAS_RE.fullmatch(text):
-        return True
-    return bool(re.fullmatch(r"\d+-\d+", text))
+    return not text or bool(HEX_ALIAS_RE.fullmatch(text)) or bool(MACHINE_PAIR_RE.fullmatch(text))
 
 
 def _meaningful_text(*values: str | None) -> str:
@@ -48,7 +46,7 @@ def _stable_identifier(value: Any) -> str:
 
 @dataclass(slots=True)
 class DaikinGateway:
-    """Gateway returned by Daikin cloud."""
+    """Gateway metadata returned by Daikin cloud."""
 
     home_id: str
     home_name: str
@@ -68,7 +66,7 @@ class DaikinGateway:
 
 @dataclass(slots=True)
 class DaikinDevice:
-    """Device discovered from local gateway room info."""
+    """Device discovered from local DTA117D611 gateway room info."""
 
     gateway_id: str
     gateway_name: str
@@ -133,3 +131,32 @@ class DaikinDevice:
                 return f"{prefix}_{stable}" if prefix else stable
         fallback = _stable_identifier(self.unique_id)
         return fallback or self.unique_id
+
+    def clone(
+        self,
+        *,
+        status: dict[str, Any] | None = None,
+        available: bool | None = None,
+        stable_id: str | None = None,
+        freeze_stable_id: bool = True,
+    ) -> DaikinDevice:
+        """Return a deep-cloned snapshot without mutating this instance."""
+        cloned = DaikinDevice(
+            gateway_id=self.gateway_id,
+            gateway_name=self.gateway_name,
+            room_id=self.room_id,
+            room_name=self.room_name,
+            room_alias=self.room_alias,
+            device_type=self.device_type,
+            device_type_name=self.device_type_name,
+            unit=self.unit,
+            name=self.name,
+            alias=self.alias,
+            status=copy.deepcopy(self.status if status is None else status),
+            available=self.available if available is None else available,
+            stable_id=self.stable_id if stable_id is None else stable_id,
+            raw=copy.deepcopy(self.raw),
+        )
+        if freeze_stable_id and cloned.stable_id is None:
+            cloned.stable_id = cloned.stable_physical_id
+        return cloned

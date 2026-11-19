@@ -1,28 +1,24 @@
-"""Coordinator for Daikin DTA117D611."""
+"""Pure-asyncio coordinator for Daikin DTA117D611."""
 
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_SCAN_INTERVAL,
-    CONF_USERNAME,
-)
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SCAN_INTERVAL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import DaikinAuthError, DaikinCloudClient, DaikinError, DaikinSocketClient, first_value, to_int, to_list
+from .cloud import DaikinCloudClient, parse_cloud_snapshot
+from .codec import DaikinAuthError, DaikinError, first_value, format_error, to_int
 from .const import (
     AIR_CON_TYPES,
-    AIR_SENSOR_TYPES,
     CONF_CONTROL_ACK_TIMEOUT,
     CONF_ENABLE_CLOUD_SNAPSHOT,
     CONF_GATEWAY,
@@ -39,37 +35,24 @@ from .const import (
     VAM_TYPES,
 )
 from .models import DaikinDevice, DaikinGateway
+from .transport import DaikinLocalTransport
 
 _LOGGER = logging.getLogger(__name__)
 
-SOURCE_METADATA_KEYS = {
-    "air_sensor_info_raw",
-    "air_sensor_status_raw",
-    "air_sensor_status_tags",
-    "cloud_physics",
-    "cloud_source",
-    "composite_raw",
-    "composite_tags",
-    "last_cloud_refresh",
-    "last_control_result",
-    "last_control_time",
-    "last_control_values",
-    "last_control_ack_body",
-    "last_control_ack_cmd",
-    "last_control_ack_request_id",
-    "last_local_refresh",
-    "local_gateway_available",
-    "local_gateway",
-    "local_source",
-    "cloud_snapshot_available",
-    "raw",
-    "state_sources",
-    "state_stale",
-}
+SOURCE_METADATA_KEYS = frozenset({
+    "air_sensor_info_raw", "air_sensor_status_raw", "air_sensor_status_tags",
+    "cloud_physics", "cloud_snapshot_available", "cloud_source",
+    "composite_raw", "composite_tags", "last_cloud_refresh",
+    "last_control_ack_body", "last_control_ack_cmd", "last_control_ack_request_id",
+    "last_control_result", "last_control_time", "last_control_values",
+    "last_local_refresh", "local_gateway", "local_gateway_available",
+    "local_source", "raw", "state_sources", "state_stale",
+})
 
 CLOUD_SNAPSHOT_INTERVAL = timedelta(minutes=10)
 WARNING_COOLDOWN = timedelta(minutes=5)
 DELAYED_REFRESH_SECONDS = 15
+FAILURE_GRACE_THRESHOLD = 3
 
 
 def _utc_now_iso() -> str:
@@ -77,12 +60,16 @@ def _utc_now_iso() -> str:
 
 
 class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
-    """Fetch cloud gateway metadata and local gateway device state."""
+    """Fetch cloud gateway metadata and local gateway device state asynchronously."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
         self.gateway: DaikinGateway | None = None
+        self.gateway_device_id: str | None = None
         self.nlc_id: str | None = None
+        self._io_lock = asyncio.Lock()
+        self._consecutive_failures = 0
+        self._failure_grace_threshold = FAILURE_GRACE_THRESHOLD
         self._cached_devices: list[DaikinDevice] | None = None
         self._last_cloud_snapshot_at: datetime | None = None
         self._last_warning_at: dict[str, datetime] = {}
@@ -91,19 +78,19 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
             timeout=self._poll_timeout,
+            bootstrap_session=async_get_clientsession(hass),
         )
-        self._delayed_refresh_task: asyncio.Task | None = None
+        self._delayed_refresh_task: asyncio.Task[None] | None = None
         update_interval = timedelta(seconds=int(self._option(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)))
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=update_interval,
-        )
+        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=update_interval)
 
     @property
-    def timeout(self) -> float:
-        return float(self._option(CONF_TIMEOUT, DEFAULT_TIMEOUT))
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    @property
+    def last_cloud_snapshot_at(self) -> datetime | None:
+        return self._last_cloud_snapshot_at
 
     @property
     def control_ack_timeout(self) -> float:
@@ -114,489 +101,255 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
 
     def _log_warning_limited(self, key: str, message: str, *args: Any) -> None:
         now = datetime.now(timezone.utc)
-        previous = self._last_warning_at.get(key)
-        if previous is None or now - previous >= WARNING_COOLDOWN:
+        if (prev := self._last_warning_at.get(key)) is None or now - prev >= WARNING_COOLDOWN:
             self._last_warning_at[key] = now
             _LOGGER.warning(message, *args)
-            return
-        _LOGGER.debug(message, *args)
+        else:
+            _LOGGER.debug(message, *args)
 
-    def _clear_warning(self, key: str) -> None:
-        self._last_warning_at.pop(key, None)
+    def _cloud_snapshot_due(self) -> bool:
+        if not bool(self._option(CONF_ENABLE_CLOUD_SNAPSHOT, DEFAULT_ENABLE_CLOUD_SNAPSHOT)):
+            return False
+        return (
+            self._last_cloud_snapshot_at is None
+            or not self.data
+            or datetime.now(timezone.utc) - self._last_cloud_snapshot_at >= CLOUD_SNAPSHOT_INTERVAL
+        )
 
-    def _cloud_snapshot_enabled(self) -> bool:
-        return bool(self._option(CONF_ENABLE_CLOUD_SNAPSHOT, DEFAULT_ENABLE_CLOUD_SNAPSHOT))
+    def _stale_devices_snapshot(self) -> dict[str, DaikinDevice]:
+        return {
+            dev_id: dev.clone(
+                status={**dev.status, "local_gateway_available": False, "state_stale": True},
+                available=dev.available,
+                stable_id=dev.stable_physical_id,
+            )
+            for dev_id, dev in (self.data or {}).items()
+        }
 
-    def _state_priority(self) -> str:
-        return str(self._option(CONF_STATE_PRIORITY, DEFAULT_STATE_PRIORITY))
-
-    def _host_override(self) -> str | None:
-        host = self.entry.data.get(CONF_HOST)
-        return str(host) if host else None
-
-    def _port_override(self) -> int | None:
-        return to_int(self.entry.data.get(CONF_PORT))
-
-    def _ensure_gateway(self) -> DaikinGateway:
+    async def _async_ensure_gateway(self) -> DaikinGateway:
         if self.gateway is not None and self.nlc_id:
             return self.gateway
-        self.cloud.ensure_login()
-        self.gateway = self.cloud.discover_gateway(
+        await self.cloud.async_ensure_login()
+        host = self.entry.data.get(CONF_HOST)
+        self.gateway = await self.cloud.async_discover_gateway(
             str(self.entry.data.get(CONF_GATEWAY, DEFAULT_GATEWAY)),
-            host_override=self._host_override(),
-            port_override=self._port_override(),
+            host_override=str(host) if host else None,
+            port_override=to_int(self.entry.data.get(CONF_PORT)),
         )
         if not self.nlc_id:
-            user_info = self.cloud.get_user_info()
-            self.nlc_id = str(first_value(user_info.get("nlcId"), (user_info.get("userInfo") or {}).get("nlcId"), ""))
+            info = await self.cloud.async_get_user_info()
+            self.nlc_id = str(first_value(info.get("nlcId"), (info.get("userInfo") or {}).get("nlcId"), ""))
         if not self.nlc_id:
             raise DaikinError("Could not get nlcId")
         return self.gateway
 
-    def _rediscover_gateway(self) -> DaikinGateway:
+    async def _async_rediscover_gateway(self) -> DaikinGateway:
         self.gateway = None
         self._cached_devices = None
-        return self._ensure_gateway()
+        return await self._async_ensure_gateway()
 
-    def _socket_client(self) -> DaikinSocketClient:
-        gateway = self._ensure_gateway()
-        return DaikinSocketClient(gateway, nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
+    def _build_transport(self, gateway: DaikinGateway) -> DaikinLocalTransport:
+        return DaikinLocalTransport(gateway, nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
 
     @staticmethod
-    def _merge_status(
-        base: dict[str, Any],
-        extra: dict[str, Any],
-        *,
-        preserve_existing_values: bool = False,
-    ) -> dict[str, Any]:
-        merged = dict(base)
+    def _source_map(status: dict[str, Any], source: str) -> dict[str, str]:
+        return {k: source for k in status if k not in SOURCE_METADATA_KEYS and not k.endswith("_raw")}
+
+    @staticmethod
+    def _merge_status(base: dict[str, Any], extra: dict[str, Any], *, preserve_existing: bool = False) -> dict[str, Any]:
+        merged = copy.deepcopy(base)
         for key, value in extra.items():
             if value in (None, ""):
                 continue
             if key == "state_sources" and isinstance(value, dict):
-                existing = merged.get(key)
-                current_sources = existing if isinstance(existing, dict) else {}
-                if preserve_existing_values:
-                    incoming_sources = {
-                        source_key: source_value
-                        for source_key, source_value in value.items()
-                        if source_key not in current_sources
-                    }
-                else:
-                    incoming_sources = value
-                merged[key] = {**current_sources, **incoming_sources}
-                continue
-            if preserve_existing_values and key not in SOURCE_METADATA_KEYS and key in merged:
-                continue
-            merged[key] = value
+                cur = dict(merged[key]) if isinstance(merged.get(key), dict) else {}
+                inc = {k: v for k, v in value.items() if k not in cur} if preserve_existing else dict(value)
+                merged[key] = {**cur, **inc}
+            elif not (preserve_existing and key not in SOURCE_METADATA_KEYS and key in merged):
+                merged[key] = copy.deepcopy(value)
         return merged
 
-    @staticmethod
-    def _source_map(status: dict[str, Any], source: str) -> dict[str, str]:
-        return {
-            key: source
-            for key in status
-            if key not in SOURCE_METADATA_KEYS and not key.endswith("_raw")
-        }
-
-    @classmethod
-    def _annotate_local_status(
-        cls,
-        status: dict[str, Any],
-        refreshed_at: str,
-        gateway: DaikinGateway,
-    ) -> dict[str, Any]:
-        if not status:
-            return status
-        return {
-            **status,
-            "last_local_refresh": refreshed_at,
-            "local_gateway": f"{gateway.host}:{gateway.port}",
-            "local_source": "socket",
-            "state_sources": cls._source_map(status, "local"),
-        }
-
-    @classmethod
-    def _cloud_status_for_item(cls, item: dict[str, Any], refreshed_at: str | None = None) -> dict[str, Any]:
-        status = item.get("status") if isinstance(item.get("status"), dict) else {}
-        physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
-        filters = item.get("filter") if isinstance(item.get("filter"), dict) else {}
-        cloud: dict[str, Any] = {
-            **status,
-            "cloud_key": item.get("key"),
-            "cloud_online": cls._cloud_bool(item.get("online")),
-            "cloud_physics": physics,
-        }
-        if item.get("key") and str(item["key"]).startswith("SENSOR:"):
-            cloud["sensor_temperature"] = cloud.get("temp")
-        elif "temp" in cloud:
-            cloud["target_temperature"] = cloud["temp"]
-        if "switches" in cloud:
-            cloud["switch"] = cloud["switches"]
-        if "volume" in cloud:
-            cloud["air_flow"] = cloud["volume"]
-        for key, value in filters.items():
-            cloud[f"filter_{key.removeprefix('filter_')}"] = value
-        if refreshed_at:
-            cloud["last_cloud_refresh"] = refreshed_at
-            cloud["cloud_source"] = "snapshot"
-        cloud = cls._normalize_cloud_status_values(cloud)
-        cloud["state_sources"] = cls._source_map(cloud, "cloud")
-        return cloud
-
-    @staticmethod
-    def _normalize_key(value: Any) -> str:
-        return str(value or "").replace(":", "").replace("-", "").casefold()
-
-    def _cloud_snapshot_due(self) -> bool:
-        if not self._cloud_snapshot_enabled():
-            return False
-        if self._last_cloud_snapshot_at is None or not self.data:
-            return True
-        return datetime.now(timezone.utc) - self._last_cloud_snapshot_at >= CLOUD_SNAPSHOT_INTERVAL
-
-    @staticmethod
-    def _cloud_bool(value: Any) -> bool | None:
-        if value in (None, ""):
-            return None
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, int):
-            return value != 0
-        text = str(value).strip().casefold()
-        if text in {"1", "true", "on", "online", "yes"}:
-            return True
-        if text in {"0", "false", "off", "offline", "no"}:
-            return False
-        return None
-
-    @staticmethod
-    def _cloud_float(value: Any) -> float | Any:
-        if value in (None, ""):
-            return value
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return value
-
-    @classmethod
-    def _normalize_cloud_status_values(cls, status: dict[str, Any]) -> dict[str, Any]:
-        normalized = dict(status)
-        for key in (
-            "switch",
-            "switches",
-            "mode",
-            "air_flow",
-            "volume",
-            "outdoor_status",
-            "filter_used_time",
-            "filter_used_percent",
-            "pm25",
-            "co2",
-            "voc",
-            "tvoc_status",
-            "hcho_status",
-        ):
-            if key in normalized:
-                normalized[key] = first_value(to_int(normalized[key]), normalized[key])
-        for key in ("temp", "target_temperature", "sensor_temperature", "humidity", "hcho", "tvoc"):
-            if key in normalized:
-                normalized[key] = cls._cloud_float(normalized[key])
-        for key in ("online", "cloud_online"):
-            if key in normalized:
-                normalized[key] = first_value(cls._cloud_bool(normalized[key]), normalized[key])
-        return normalized
-
-    def _merge_cloud_snapshot(self, devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
-        if not self._cloud_snapshot_enabled():
-            return False
-        gateway = self._ensure_gateway()
-        candidates = [gateway.key]
-        if gateway.mac and gateway.mac != gateway.key:
-            candidates.append(gateway.mac)
-
+    async def _async_merge_cloud_snapshot(self, devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
+        gateway = await self._async_ensure_gateway()
         snapshot: dict[str, Any] = {}
-        last_error: Exception | None = None
-        for candidate in candidates:
-            if not candidate:
-                continue
+        for candidate in dict.fromkeys(c for c in (gateway.key, gateway.mac) if c):
             try:
-                snapshot = self.cloud.get_ipbox_snapshot(candidate)
+                snapshot = await self.cloud.async_get_ipbox_snapshot(candidate)
                 break
+            except DaikinAuthError:
+                raise
             except DaikinError as exc:
-                last_error = exc
-                _LOGGER.debug("Failed to get ipbox snapshot for %s", candidate, exc_info=True)
+                _LOGGER.debug("Failed to get ipbox snapshot for %s: %s", candidate, format_error(exc))
         if not snapshot:
-            if last_error:
-                _LOGGER.debug("No ipbox snapshot available: %s", last_error)
             return False
-        refreshed_at = _utc_now_iso()
 
-        online_by_key: dict[str, Any] = {}
-        for ipbox in snapshot.get("ipbox", []):
-            if not isinstance(ipbox, dict):
-                continue
-            for sub_item in ipbox.get("sub", []):
-                if isinstance(sub_item, dict) and sub_item.get("device_key"):
-                    online_by_key[str(sub_item["device_key"])] = sub_item.get("online")
-
-        indoor_items = [item for item in snapshot.get("indoor", []) if isinstance(item, dict)]
-        vam_raw = to_list(snapshot.get("mini_vam")) + to_list(snapshot.get("vam"))
-        vam_items = [item for item in vam_raw if isinstance(item, dict)]
-        sensor_items = [item for item in snapshot.get("sensor", []) if isinstance(item, dict)]
-
-        for device in devices:
-            item = self._match_cloud_item(device, indoor_items, vam_items, sensor_items)
-            if item is None:
-                continue
-            cloud_key = item.get("key")
-            if item.get("online") is None and cloud_key in online_by_key:
-                item = {**item, "online": online_by_key[str(cloud_key)]}
-            preserve_existing = self._state_priority() == STATE_PRIORITY_LOCAL_FIRST
-            statuses[device.unique_id] = self._merge_status(
-                statuses.get(device.unique_id, {}),
-                self._cloud_status_for_item(item, refreshed_at),
-                preserve_existing_values=preserve_existing,
+        preserve = str(self._option(CONF_STATE_PRIORITY, DEFAULT_STATE_PRIORITY)) == STATE_PRIORITY_LOCAL_FIRST
+        for dev_id, cloud_status in parse_cloud_snapshot(snapshot, devices, _utc_now_iso()).items():
+            cloud_status["state_sources"] = self._source_map(cloud_status, "cloud")
+            statuses[dev_id] = self._merge_status(
+                statuses.get(dev_id, {}),
+                cloud_status,
+                preserve_existing=preserve,
             )
         return True
 
-    def _match_cloud_item(
-        self,
-        device: DaikinDevice,
-        indoor_items: list[dict[str, Any]],
-        vam_items: list[dict[str, Any]],
-        sensor_items: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        if device.device_type in AIR_CON_TYPES:
-            candidates = indoor_items
-        elif device.device_type in VAM_TYPES:
-            candidates = vam_items
-        elif device.device_type in AIR_SENSOR_TYPES:
-            candidates = sensor_items
-        else:
-            return None
-
-        device_key = self._normalize_key(device.name)
-        device_alias = self._normalize_key(device.alias)
-        for item in candidates:
-            physics = item.get("physics") if isinstance(item.get("physics"), dict) else {}
-            socket_room_id = to_int(physics.get("socket_room_id"))
-            center_address = to_int(physics.get("center_address"))
-            if socket_room_id == device.room_id or center_address == device.room_id - 1:
-                return item
-
-            cloud_parts = [
-                item.get("key"),
-                physics.get("serial_no"),
-                physics.get("mac"),
-                physics.get("device_no"),
-            ]
-            haystack = " ".join(self._normalize_key(part) for part in cloud_parts)
-            if device_key and device_key in haystack:
-                return item
-            if device_alias and device_alias in haystack:
-                return item
-        return None
-
     @staticmethod
     def _has_local_control_status(devices: list[DaikinDevice], statuses: dict[str, dict[str, Any]]) -> bool:
-        controllable_devices = [
-            device
-            for device in devices
-            if device.device_type in AIR_CON_TYPES or device.device_type in VAM_TYPES
-        ]
-        if not controllable_devices:
-            return bool(statuses)
-        return any(
-            device.device_type in AIR_CON_TYPES or device.device_type in VAM_TYPES
-            for device in controllable_devices
-            if statuses.get(device.unique_id)
-        )
+        controllable = [d for d in devices if d.device_type in AIR_CON_TYPES or d.device_type in VAM_TYPES]
+        return any(bool(statuses.get(d.unique_id)) for d in controllable) if controllable else bool(statuses)
 
-    def _refresh_sync(self) -> dict[str, DaikinDevice]:
-        socket_client = self._socket_client()
-        if self._cached_devices:
-            devices = self._cached_devices
+    async def _async_poll_local(
+        self, gateway: DaikinGateway, previous_data: dict[str, DaikinDevice], *, reuse_cached: bool,
+    ) -> tuple[list[DaikinDevice], dict[str, dict[str, Any]]]:
+        transport = self._build_transport(gateway)
+        if reuse_cached and self._cached_devices:
+            devices = list(self._cached_devices)
         else:
             try:
-                devices = socket_client.query_devices()
-                self._cached_devices = devices
-                self._clear_warning("room_list")
+                devices = await transport.async_query_devices()
+                self._cached_devices = [d.clone(status={}, available=True) for d in devices]
+                self._last_warning_at.pop("room_list", None)
             except DaikinAuthError:
                 raise
             except (DaikinError, TimeoutError, OSError) as exc:
-                if self.data:
-                    self._log_warning_limited(
-                        "room_list",
-                        "Failed to refresh Daikin D611 room list; using previous devices: %s",
-                        exc,
-                    )
-                    devices = list(self.data.values())
-                    self._cached_devices = devices
-                else:
+                if not reuse_cached or not previous_data:
                     raise
-        try:
-            statuses = socket_client.query_statuses(devices)
-            if not self._has_local_control_status(devices, statuses):
-                raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
-            self._clear_warning("local_status")
-        except DaikinAuthError:
-            raise
-        except (DaikinError, TimeoutError, OSError) as exc:
-            self._log_warning_limited(
-                "local_status",
-                "Failed to refresh Daikin D611 statuses via %s; rediscovering gateway: %s",
-                socket_client.gateway.host,
-                exc,
-            )
+                self._log_warning_limited("room_list", "Failed to refresh Daikin room list; using cached devices: %s", format_error(exc))
+                devices = [d.clone(status={}, available=d.available) for d in previous_data.values()]
+                self._cached_devices = list(devices)
+
+        statuses = await transport.async_query_statuses(devices)
+        if not self._has_local_control_status(devices, statuses):
+            raise DaikinError(f"No local status returned from gateway {gateway.host}")
+        return devices, statuses
+
+    async def _async_refresh_devices(self) -> dict[str, DaikinDevice]:
+        async with self._io_lock:
+            previous_data = dict(self.data) if self.data else {}
+            gateway = await self._async_ensure_gateway()
+            local_error: Exception | None = None
+            devices: list[DaikinDevice] = list(self._cached_devices or previous_data.values())
             try:
-                socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
-                devices = socket_client.query_devices()
-                self._cached_devices = devices
-                statuses = socket_client.query_statuses(devices)
-                if not self._has_local_control_status(devices, statuses):
-                    raise DaikinError(f"No local status returned from gateway {socket_client.gateway.host}")
-                self._clear_warning("local_status")
-                self._clear_warning("local_status_retry")
-            except DaikinAuthError:
-                raise
-            except (DaikinError, TimeoutError, OSError) as retry_exc:
-                if not self.data:
-                    raise
-                self._log_warning_limited(
-                    "local_status_retry",
-                    "Failed to refresh Daikin D611 statuses after gateway rediscovery; keeping previous values: %s",
-                    retry_exc,
-                )
-                statuses = {}
-        refreshed_at = _utc_now_iso()
-        statuses = {
-            device_id: self._annotate_local_status(status, refreshed_at, socket_client.gateway)
-            for device_id, status in statuses.items()
-        }
-        cloud_snapshot_attempted = self._cloud_snapshot_due()
-        if cloud_snapshot_attempted:
-            try:
-                if self._merge_cloud_snapshot(devices, statuses):
-                    self._last_cloud_snapshot_at = datetime.now(timezone.utc)
-                    self._clear_warning("cloud_snapshot")
+                devices, statuses = await self._async_poll_local(gateway, previous_data, reuse_cached=True)
+                self._last_warning_at.pop("local_status", None)
             except DaikinAuthError:
                 raise
             except (DaikinError, TimeoutError, OSError) as exc:
-                self._log_warning_limited(
-                    "cloud_snapshot",
-                    "Failed to refresh Daikin D611 cloud snapshot; using local state: %s",
-                    exc,
+                self._log_warning_limited("local_status", "Local poll via %s failed; rediscovering: %s", gateway.host, format_error(exc))
+                try:
+                    gateway = await self._async_rediscover_gateway()
+                    devices, statuses = await self._async_poll_local(gateway, previous_data, reuse_cached=False)
+                    self._last_warning_at.pop("local_status", None)
+                    self._last_warning_at.pop("local_status_retry", None)
+                except DaikinAuthError:
+                    raise
+                except (DaikinError, TimeoutError, OSError) as retry_exc:
+                    if not previous_data:
+                        raise
+                    local_error, statuses = retry_exc, {}
+                    self._log_warning_limited("local_status_retry", "Local poll failed after rediscovery: %s", format_error(retry_exc))
+
+            refreshed_at = _utc_now_iso()
+            statuses = {
+                dev_id: {
+                    **st,
+                    "last_local_refresh": refreshed_at,
+                    "local_gateway": f"{gateway.host}:{gateway.port}",
+                    "local_source": "socket",
+                    "state_sources": self._source_map(st, "local"),
+                }
+                for dev_id, st in statuses.items() if st
+            }
+            cloud_attempted = self._cloud_snapshot_due()
+            if cloud_attempted:
+                try:
+                    if await self._async_merge_cloud_snapshot(devices, statuses):
+                        self._last_cloud_snapshot_at = datetime.now(timezone.utc)
+                        self._last_warning_at.pop("cloud_snapshot", None)
+                except DaikinAuthError:
+                    raise
+                except (DaikinError, TimeoutError, OSError) as exc:
+                    self._log_warning_limited("cloud_snapshot", "Cloud snapshot refresh failed; using local state: %s", format_error(exc))
+
+            if local_error is not None and not any(s.get("last_local_refresh") or s.get("last_cloud_refresh") for s in statuses.values()):
+                raise local_error
+
+            result: dict[str, DaikinDevice] = {}
+            for template in devices:
+                update = copy.deepcopy(statuses.get(template.unique_id, {}))
+                fresh_local, fresh_cloud = bool(update.get("last_local_refresh")), bool(update.get("last_cloud_refresh"))
+                previous = previous_data.get(template.unique_id)
+                update["local_gateway_available"] = fresh_local
+                update["cloud_snapshot_available"] = (
+                    fresh_cloud if (cloud_attempted or previous is None) else bool(previous.status.get("cloud_snapshot_available"))
                 )
-        result: dict[str, DaikinDevice] = {}
-        for device in devices:
-            status_update = statuses.setdefault(device.unique_id, {})
-            fresh_local = bool(status_update.get("last_local_refresh"))
-            fresh_cloud = bool(status_update.get("last_cloud_refresh"))
-            previous = self.data.get(device.unique_id) if self.data else None
-            status_update["local_gateway_available"] = fresh_local
-            if cloud_snapshot_attempted or previous is None:
-                status_update["cloud_snapshot_available"] = fresh_cloud
-            else:
-                status_update["cloud_snapshot_available"] = bool(previous.status.get("cloud_snapshot_available"))
-            status_update["state_stale"] = not (fresh_local or fresh_cloud)
-            if previous is not None:
-                device.status = {**previous.status, **statuses.get(device.unique_id, {})}
-                device.stable_id = previous.stable_physical_id
-            else:
-                device.status = statuses.get(device.unique_id, device.status)
-                device.stable_id = device.stable_physical_id
-            device.available = not device.status.get("state_stale", False)
-            result[device.unique_id] = device
-        return result
+                update["state_stale"] = not (fresh_local or fresh_cloud)
+                merged = {**copy.deepcopy(previous.status if previous is not None else template.status), **update}
+                snapshot = template.clone(
+                    status=merged,
+                    available=not merged.get("state_stale", False),
+                    stable_id=previous.stable_physical_id if previous is not None else None,
+                )
+                result[snapshot.unique_id] = snapshot
+            return result
 
     async def _async_update_data(self) -> dict[str, DaikinDevice]:
         try:
-            return await self.hass.async_add_executor_job(self._refresh_sync)
+            data = await self._async_refresh_devices()
         except DaikinAuthError as exc:
-            raise ConfigEntryAuthFailed(str(exc)) from exc
+            raise ConfigEntryAuthFailed(format_error(exc)) from exc
         except (DaikinError, TimeoutError, OSError) as exc:
-            if self.data:
-                self._log_warning_limited("update", "Daikin D611 update failed; keeping previous data: %s", exc)
-                return self.data
-            raise UpdateFailed(str(exc)) from exc
+            if not self.data:
+                raise UpdateFailed(format_error(exc)) from exc
+            self._consecutive_failures += 1
+            if self._consecutive_failures > self._failure_grace_threshold:
+                raise UpdateFailed(format_error(exc)) from exc
+            self._log_warning_limited(
+                "update", "Daikin D611 update failed (%s/%s); keeping stale data: %s",
+                self._consecutive_failures, self._failure_grace_threshold, format_error(exc),
+            )
+            return self._stale_devices_snapshot()
+        self._consecutive_failures = 0
+        return data
 
-    def _control_sync(self, device_id: str, values: dict[str, Any]) -> dict[str, Any]:
-        device = self.data[device_id]
-        socket_client = self._socket_client()
-        try:
-            result = socket_client.control_device(device, ack_timeout=self.control_ack_timeout, **values)
-        except (DaikinError, TimeoutError, OSError) as exc:
-            _LOGGER.warning("Daikin D611 control via %s failed; rediscovering gateway: %s", socket_client.gateway.host, exc)
-            socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
-            try:
-                retry_result = socket_client.control_device(device, ack_timeout=max(self.control_ack_timeout, 5), **values)
-            except (DaikinError, TimeoutError, OSError) as retry_exc:
-                raise DaikinError(f"Control command failed after gateway rediscovery: {retry_exc}") from retry_exc
-            if retry_result.get("result") in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
-                return retry_result
-            raise DaikinError(f"Control command was not accepted: {retry_result}")
-
-        if result.get("result") in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
-            return result
-        _LOGGER.warning("Daikin D611 control via %s returned %s; rediscovering gateway", socket_client.gateway.host, result.get("result"))
-        socket_client = DaikinSocketClient(self._rediscover_gateway(), nlc_id=str(self.nlc_id), timeout=self._poll_timeout)
-        try:
-            retry_result = socket_client.control_device(device, ack_timeout=max(self.control_ack_timeout, 5), **values)
-        except (DaikinError, TimeoutError, OSError) as exc:
-            raise DaikinError(f"Control command failed after gateway rediscovery: {exc}") from exc
-        if retry_result.get("result") not in {"accepted", "sent_ack_timeout", "sent_no_ack_configured"}:
-            raise DaikinError(f"Control command was not accepted: {retry_result}")
-        return retry_result
-
-    def _apply_optimistic_status(
-        self,
-        device_id: str,
-        values: dict[str, Any],
-        control_result: dict[str, Any] | None = None,
-    ) -> None:
+    def _apply_optimistic_status(self, device_id: str, values: dict[str, Any], control_result: dict[str, Any] | None = None) -> None:
         if not self.data or device_id not in self.data:
             return
-
         device = self.data[device_id]
         status: dict[str, Any] = {}
         if "switch" in values:
             status["switch"] = values["switch"]
             if device.device_type in VAM_TYPES:
                 status["switches"] = values["switch"]
-        if "mode" in values:
-            status["mode"] = values["mode"]
-        if "air_flow" in values:
-            status["air_flow"] = values["air_flow"]
-        if "temperature" in values:
-            status["target_temperature"] = values["temperature"]
-
+        for src, dst in (("mode", "mode"), ("air_flow", "air_flow"), ("temperature", "target_temperature")):
+            if src in values:
+                status[dst] = values[src]
         if not status:
             return
-        now = _utc_now_iso()
-        status["last_control_time"] = now
-        if control_result:
-            status["last_control_result"] = control_result.get("result") or "local_command_sent"
-            status["last_control_ack_cmd"] = control_result.get("ack_cmd")
-            status["last_control_ack_body"] = control_result.get("ack_body")
-            status["last_control_ack_request_id"] = control_result.get("ack_request_id")
-        else:
-            status["last_control_result"] = "optimistic_local_command_sent"
-        status["last_control_values"] = dict(values)
-        status["local_gateway_available"] = True
-        status["state_stale"] = False
+
+        status.update({
+            "last_control_time": _utc_now_iso(),
+            "last_control_result": (control_result or {}).get("result") or "optimistic_local_command_sent",
+            "last_control_ack_cmd": (control_result or {}).get("ack_cmd"),
+            "last_control_ack_body": (control_result or {}).get("ack_body"),
+            "last_control_ack_request_id": (control_result or {}).get("ack_request_id"),
+            "last_control_values": dict(values),
+            "local_gateway_available": True,
+            "state_stale": False,
+        })
         status["state_sources"] = self._source_map(status, "optimistic")
-        device.status = self._merge_status(device.status, status)
-        device.available = True
-        self.async_set_updated_data(dict(self.data))
+        updated = dict(self.data)
+        updated[device_id] = device.clone(
+            status=self._merge_status(device.status, status), available=True, stable_id=device.stable_physical_id,
+        )
+        self.async_set_updated_data(updated)
 
     async def _async_delayed_refresh(self) -> None:
         await asyncio.sleep(DELAYED_REFRESH_SECONDS)
         await self.async_request_refresh()
 
     def _schedule_delayed_refresh(self) -> None:
-        if self._delayed_refresh_task and not self._delayed_refresh_task.done():
-            self._delayed_refresh_task.cancel()
+        self.cancel_delayed_refresh()
         self._delayed_refresh_task = self.hass.async_create_task(self._async_delayed_refresh())
 
     def cancel_delayed_refresh(self) -> None:
@@ -604,9 +357,43 @@ class DaikinD611Coordinator(DataUpdateCoordinator[dict[str, DaikinDevice]]):
             self._delayed_refresh_task.cancel()
         self._delayed_refresh_task = None
 
-    async def async_control_device(self, device_id: str, **values: Any) -> None:
-        """Send a local socket control command, then refresh state."""
+    async def async_shutdown(self) -> None:
+        """Cancel pending tasks and release cloud mTLS resources."""
+        self.cancel_delayed_refresh()
+        await self.cloud.async_close()
+        if (parent_shutdown := getattr(super(), "async_shutdown", None)) is not None:
+            await parent_shutdown()
 
-        control_result = await self.hass.async_add_executor_job(self._control_sync, device_id, values)
-        self._apply_optimistic_status(device_id, values, control_result)
+    async def async_control_device(self, device_id: str, **values: Any) -> None:
+        """Send a local TCP control command without duplicating commands on ACK timeout."""
+        async with self._io_lock:
+            device = (self.data or {}).get(device_id)
+            if device is None:
+                raise DaikinError(f"Unknown Daikin device: {device_id}")
+            gateway = await self._async_ensure_gateway()
+            try:
+                result = await self._build_transport(gateway).async_control_device(
+                    device, ack_timeout=self.control_ack_timeout, **values,
+                )
+            except DaikinAuthError:
+                raise
+            except (DaikinError, TimeoutError, OSError) as exc:
+                _LOGGER.warning("Control via %s failed before send; rediscovering gateway: %s", gateway.host, format_error(exc))
+                gateway = await self._async_rediscover_gateway()
+                try:
+                    result = await self._build_transport(gateway).async_control_device(
+                        device, ack_timeout=max(self.control_ack_timeout, 5.0), **values,
+                    )
+                except DaikinAuthError:
+                    raise
+                except (DaikinError, TimeoutError, OSError) as retry_exc:
+                    raise DaikinError(f"Control command failed after gateway rediscovery: {format_error(retry_exc)}") from retry_exc
+
+            outcome = result.get("result")
+            if outcome == "sent_ack_timeout":
+                _LOGGER.debug("Control command for %s sent cleanly but ACK timed out; skipping duplicate resend", device_id)
+            elif outcome not in {"accepted", "sent_no_ack_configured"}:
+                raise DaikinError(f"Control command was not accepted: {result}")
+
+        self._apply_optimistic_status(device_id, values, result)
         self._schedule_delayed_refresh()

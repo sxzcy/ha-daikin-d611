@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import AIR_CON_TYPES, DOMAIN, VAM_TYPES
+from .const import AIR_CON_TYPES, VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
 from .mappings import (
@@ -23,18 +24,19 @@ from .mappings import (
 )
 from .models import DaikinDevice
 
+if TYPE_CHECKING:
+    from . import DaikinD611ConfigEntry
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, kw_only=True)
 class DaikinD611SelectDescription(SelectEntityDescription):
-    """Description for a Daikin select entity."""
+    """Declarative description for a Daikin select entity."""
 
-    options_map: dict[int, str] | None = None
-    values_map: dict[str, int] | None = None
-    status_key: str = ""
-    control_key: str = ""
-    read_keys: tuple[str, ...] = ()
-    force_power_on: bool = False
-    available_fn: Callable[[DaikinDevice], bool] | None = None
+    options_map: dict[int, str]
+    values_map: dict[str, int]
+    control_key: str
+    read_keys: tuple[str, ...]
+    force_power_on: bool = True
 
 
 def _status_value(device: DaikinDevice, *keys: str) -> Any:
@@ -52,10 +54,8 @@ AIRCON_SELECTS: tuple[DaikinD611SelectDescription, ...] = (
         options=list(AIRCON_MODE_VALUES),
         options_map=AIRCON_MODES,
         values_map=AIRCON_MODE_VALUES,
-        status_key="mode",
         control_key="mode",
         read_keys=("mode",),
-        force_power_on=True,
     ),
     DaikinD611SelectDescription(
         key="fan",
@@ -63,10 +63,8 @@ AIRCON_SELECTS: tuple[DaikinD611SelectDescription, ...] = (
         options=list(AIRCON_FAN_VALUES),
         options_map=AIRCON_FAN,
         values_map=AIRCON_FAN_VALUES,
-        status_key="air_flow",
         control_key="air_flow",
         read_keys=("air_flow", "volume"),
-        force_power_on=True,
     ),
 )
 
@@ -77,10 +75,8 @@ VAM_SELECTS: tuple[DaikinD611SelectDescription, ...] = (
         options=list(VAM_MODE_VALUES),
         options_map=VAM_MODES,
         values_map=VAM_MODE_VALUES,
-        status_key="mode",
         control_key="mode",
         read_keys=("mode",),
-        force_power_on=True,
     ),
     DaikinD611SelectDescription(
         key="air_flow",
@@ -88,18 +84,19 @@ VAM_SELECTS: tuple[DaikinD611SelectDescription, ...] = (
         options=list(VAM_AIR_FLOW_VALUES),
         options_map=VAM_AIR_FLOW,
         values_map=VAM_AIR_FLOW_VALUES,
-        status_key="air_flow",
         control_key="air_flow",
         read_keys=("air_flow",),
-        force_power_on=True,
     ),
 )
 
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    """Set up select entities."""
-
-    coordinator: DaikinD611Coordinator = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: DaikinD611ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Daikin D611 select entities."""
+    coordinator = entry.runtime_data
     entities: list[DaikinD611Select] = []
     for device_id, device in coordinator.data.items():
         if device.device_type in AIR_CON_TYPES:
@@ -108,12 +105,12 @@ async def async_setup_entry(hass, entry, async_add_entities) -> None:
             descriptions = VAM_SELECTS
         else:
             continue
-        entities.extend(DaikinD611Select(coordinator, device_id, description) for description in descriptions)
+        entities.extend(DaikinD611Select(coordinator, device_id, desc) for desc in descriptions)
     async_add_entities(entities)
 
 
 class DaikinD611Select(DaikinD611Entity, SelectEntity):
-    """Daikin mode or speed select."""
+    """Daikin mode or fan-speed select entity."""
 
     entity_description: DaikinD611SelectDescription
 
@@ -131,16 +128,14 @@ class DaikinD611Select(DaikinD611Entity, SelectEntity):
     @property
     def current_option(self) -> str | None:
         value = _status_value(self.device, *self.entity_description.read_keys)
-        if value is None or self.entity_description.options_map is None:
+        if value is None:
             return None
         return self.entity_description.options_map.get(value, str(value))
 
     async def async_select_option(self, option: str) -> None:
-        if self.entity_description.values_map is None or option not in self.entity_description.values_map:
+        if option not in self.entity_description.values_map:
             return
-        values: dict[str, Any] = {
-            self.entity_description.control_key: self.entity_description.values_map[option],
-        }
+        values: dict[str, Any] = {self.entity_description.control_key: self.entity_description.values_map[option]}
         if self.entity_description.force_power_on:
             values["switch"] = 1
-        await self.coordinator.async_control_device(self.device_id, **values)
+        await self._async_control_device(**values)

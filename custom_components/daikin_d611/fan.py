@@ -1,36 +1,33 @@
-"""Fan entities for Daikin DTA117D611 VAM devices."""
+"""Fan entities for Daikin DTA117D611 VAM / Mini-VAM devices."""
 
 from __future__ import annotations
 
-from homeassistant.components.fan import FanEntity, FanEntityFeature
+from typing import TYPE_CHECKING, Any
 
-from .const import DOMAIN, VAM_TYPES
+from homeassistant.components.fan import FanEntity, FanEntityFeature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+from .const import VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
+from .mappings import VAM_MODES, VAM_MODE_VALUES
 
-PRESET_MODES = {
-    "内循环": 0,
-    "热交换": 1,
-    "自动": 2,
-    "防污染": 3,
-    "排异味": 4,
-}
-PRESET_TO_MODE = {value: key for key, value in PRESET_MODES.items()}
-PERCENT_TO_AIR_FLOW = {
-    25: 1,
-    50: 2,
-    75: 3,
-    100: 4,
-}
-AIR_FLOW_TO_PERCENT = {value: key for key, value in PERCENT_TO_AIR_FLOW.items()}
+if TYPE_CHECKING:
+    from . import DaikinD611ConfigEntry
+
+AIR_FLOW_TO_PERCENT: dict[int, int] = {1: 25, 2: 50, 3: 75, 4: 100}
 TURN_ON_FEATURE = getattr(FanEntityFeature, "TURN_ON", 0)
 TURN_OFF_FEATURE = getattr(FanEntityFeature, "TURN_OFF", 0)
 
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    """Set up fan entities."""
-
-    coordinator: DaikinD611Coordinator = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: DaikinD611ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Daikin D611 fan entities."""
+    coordinator = entry.runtime_data
     async_add_entities(
         DaikinD611Fan(coordinator, device_id)
         for device_id, device in coordinator.data.items()
@@ -39,7 +36,7 @@ async def async_setup_entry(hass, entry, async_add_entities) -> None:
 
 
 class DaikinD611Fan(DaikinD611Entity, FanEntity):
-    """Daikin VAM / Mini VAM fan."""
+    """Daikin VAM / Mini-VAM ventilation fan."""
 
     _attr_supported_features = (
         FanEntityFeature.SET_SPEED
@@ -47,7 +44,7 @@ class DaikinD611Fan(DaikinD611Entity, FanEntity):
         | TURN_ON_FEATURE
         | TURN_OFF_FEATURE
     )
-    _attr_preset_modes = list(PRESET_MODES)
+    _attr_preset_modes = list(VAM_MODE_VALUES)
 
     def __init__(self, coordinator: DaikinD611Coordinator, device_id: str) -> None:
         super().__init__(coordinator, device_id)
@@ -64,33 +61,34 @@ class DaikinD611Fan(DaikinD611Entity, FanEntity):
 
     @property
     def preset_mode(self) -> str | None:
-        return PRESET_TO_MODE.get(self.device.status.get("mode"))
+        return VAM_MODES.get(self.device.status.get("mode"))
 
-    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
-        values = {"switch": 1}
+    async def async_turn_on(
+        self,
+        percentage: int | None = None,
+        preset_mode: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        values: dict[str, Any] = {"switch": 1}
         if percentage is not None:
             values["air_flow"] = self._percentage_to_air_flow(percentage)
-        if preset_mode in PRESET_MODES:
-            values["mode"] = PRESET_MODES[preset_mode]
-        await self.coordinator.async_control_device(self.device_id, **values)
+        if preset_mode in VAM_MODE_VALUES:
+            values["mode"] = VAM_MODE_VALUES[preset_mode]
+        await self._async_control_device(**values)
 
-    async def async_turn_off(self, **kwargs) -> None:
-        await self.coordinator.async_control_device(self.device_id, switch=0)
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._async_control_device(switch=0)
 
     async def async_set_percentage(self, percentage: int) -> None:
         if percentage <= 0:
             await self.async_turn_off()
             return
-        await self.coordinator.async_control_device(
-            self.device_id,
-            switch=1,
-            air_flow=self._percentage_to_air_flow(percentage),
-        )
+        await self._async_control_device(switch=1, air_flow=self._percentage_to_air_flow(percentage))
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        if preset_mode not in PRESET_MODES:
+        if preset_mode not in VAM_MODE_VALUES:
             return
-        await self.coordinator.async_control_device(self.device_id, mode=PRESET_MODES[preset_mode])
+        await self._async_control_device(mode=VAM_MODE_VALUES[preset_mode])
 
     @staticmethod
     def _percentage_to_air_flow(percentage: int) -> int:

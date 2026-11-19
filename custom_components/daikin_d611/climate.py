@@ -1,18 +1,24 @@
-"""Climate entities for Daikin DTA117D611."""
+"""Climate entities for Daikin DTA117D611 indoor AC units."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import HVACAction, HVACMode
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, DOMAIN, VAM_TYPES
+from .const import AIR_CON_TYPES, AIR_SENSOR_TYPES, VAM_TYPES
 from .coordinator import DaikinD611Coordinator
 from .entity import DaikinD611Entity
+from .mappings import AIRCON_FAN, AIRCON_FAN_VALUES
 
-MODE_TO_HVAC = {
+if TYPE_CHECKING:
+    from . import DaikinD611ConfigEntry
+
+MODE_TO_HVAC: dict[int, HVACMode] = {
     0: HVACMode.COOL,
     1: HVACMode.DRY,
     2: HVACMode.FAN_ONLY,
@@ -24,7 +30,7 @@ MODE_TO_HVAC = {
     8: HVACMode.HEAT,
     9: HVACMode.DRY,
 }
-MODE_TO_ACTION = {
+MODE_TO_ACTION: dict[int, HVACAction] = {
     0: HVACAction.COOLING,
     1: HVACAction.DRYING,
     2: HVACAction.FAN,
@@ -36,20 +42,12 @@ MODE_TO_ACTION = {
     8: HVACAction.HEATING,
     9: HVACAction.DRYING,
 }
-HVAC_TO_MODE = {
+HVAC_TO_MODE: dict[HVACMode, int] = {
     HVACMode.COOL: 0,
     HVACMode.DRY: 1,
     HVACMode.FAN_ONLY: 2,
     HVACMode.AUTO: 3,
     HVACMode.HEAT: 4,
-}
-FAN_MODES = {
-    "最弱": 0,
-    "弱": 1,
-    "中": 2,
-    "强": 3,
-    "最强": 4,
-    "自动": 5,
 }
 TURN_ON_FEATURE = getattr(ClimateEntityFeature, "TURN_ON", 0)
 TURN_OFF_FEATURE = getattr(ClimateEntityFeature, "TURN_OFF", 0)
@@ -67,10 +65,13 @@ def _first_number(status: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-async def async_setup_entry(hass, entry, async_add_entities) -> None:
-    """Set up climate entities."""
-
-    coordinator: DaikinD611Coordinator = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: DaikinD611ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Daikin D611 climate entities."""
+    coordinator = entry.runtime_data
     async_add_entities(
         DaikinD611Climate(coordinator, device_id)
         for device_id, device in coordinator.data.items()
@@ -79,9 +80,9 @@ async def async_setup_entry(hass, entry, async_add_entities) -> None:
 
 
 class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
-    """Daikin indoor unit."""
+    """Daikin DTA117D611 indoor AC unit."""
 
-    _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_target_temperature_step = 0.5
     _attr_min_temp = 16
     _attr_max_temp = 32
@@ -99,7 +100,7 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         HVACMode.FAN_ONLY,
         HVACMode.AUTO,
     ]
-    _attr_fan_modes = list(FAN_MODES)
+    _attr_fan_modes = list(AIRCON_FAN_VALUES)
 
     def __init__(self, coordinator: DaikinD611Coordinator, device_id: str) -> None:
         super().__init__(coordinator, device_id)
@@ -123,11 +124,11 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         return MODE_TO_ACTION.get(self.status.get("mode"))
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         return _first_number(self.status, "target_temperature", "temp")
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         return self._room_status_number(
             "room_temperature",
             "indoor_temperature",
@@ -149,41 +150,37 @@ class DaikinD611Climate(DaikinD611Entity, ClimateEntity):
         value = self.status.get("air_flow")
         if value is None:
             value = self.status.get("volume")
-        for name, number in FAN_MODES.items():
-            if number == value:
-                return name
-        return None
+        return AIRCON_FAN.get(value)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == HVACMode.OFF:
-            await self.coordinator.async_control_device(self.device_id, switch=0)
+            await self._async_control_device(switch=0)
             return
         values: dict[str, Any] = {"switch": 1}
         if hvac_mode in HVAC_TO_MODE:
             values["mode"] = HVAC_TO_MODE[hvac_mode]
-        await self.coordinator.async_control_device(self.device_id, **values)
+        await self._async_control_device(**values)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self.coordinator.async_control_device(self.device_id, switch=1)
+        await self._async_control_device(switch=1)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.async_control_device(self.device_id, switch=0)
+        await self._async_control_device(switch=0)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
-        await self.coordinator.async_control_device(self.device_id, temperature=float(temperature))
+        await self._async_control_device(temperature=float(temperature))
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        if fan_mode not in FAN_MODES:
+        if fan_mode not in AIRCON_FAN_VALUES:
             return
-        await self.coordinator.async_control_device(self.device_id, air_flow=FAN_MODES[fan_mode])
+        await self._async_control_device(air_flow=AIRCON_FAN_VALUES[fan_mode])
 
     def _room_status_number(self, *keys: str) -> float | None:
         if (value := _first_number(self.status, *keys)) is not None:
             return value
-
         for device in self.coordinator.data.values():
             if device.unique_id == self.device_id or device.room_id != self.device.room_id:
                 continue
